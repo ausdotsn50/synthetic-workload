@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# raw measurement output — regenerated, never edited by hand (spec §1.3)
+results/
