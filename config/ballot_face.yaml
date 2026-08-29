@@ -1,0 +1,32 @@
+# To do: modify ballot face config if needed
+nle2025:
+  description: 2025 NLE overseas ballot face
+  questions:
+    - short_name: senator
+      question: Vote for up to 12 Senators
+      answer_count: 66
+      min: 0
+      max: 12
+      answer_prefix: Senator
+    - short_name: partylist
+      question: Vote for 1 Party-list group
+      answer_count: 156
+      min: 0
+      max: 1
+      answer_prefix: Partylist
+
+smoke:
+  description: tiny face for plumbing checks only
+  questions:
+    - short_name: q1
+      question: Pick up to 2
+      answer_count: 3
+      min: 0
+      max: 2
+      answer_prefix: Option
+    - short_name: q2
+      question: Pick 1
+      answer_count: 3
+      min: 0
+      max: 1
+      answer_prefix: Choice
