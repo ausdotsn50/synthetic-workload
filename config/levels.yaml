@@ -1,0 +1,15 @@
+# Default values for level config
+schemes:
+  - elgamal          
+
+levels: # Electoral size/voter count
+  - 10
+
+repetitions: 1
+
+# For reproducibility, seed per config election run
+seed: 424242
+
+helios:
+  url: http://localhost:8000
+  path: ../helios-server
