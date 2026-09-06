@@ -3,6 +3,10 @@ status: checked
 Bootstrap Helios so the in-process stages (1, 3, 4) can import its code.
 
 This module must be imported BEFORE any `helios.*` or `django.*` import.
+
+Celery worker note
+# Email backend configuration
+# In development mode, set EMAIL_USE_CONSOLE=1 to print emails to stdout
 """
 
 import os
