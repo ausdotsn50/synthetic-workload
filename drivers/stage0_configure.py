@@ -24,6 +24,7 @@ def configure(*, base_url, short_name, name, questions, n_voters,
 
   # See helios/forms.py for ElectionForm schema
   # Generates trustee keypair
+  # election.generate_trustee(ELGAMAL_PARAMS) in election_new in views.py
   log(f'POST /helios/elections/new  short_name={short_name}')
   s.post('/helios/elections/new', data={
     'short_name': short_name,
@@ -58,7 +59,7 @@ def configure(*, base_url, short_name, name, questions, n_voters,
     raise RuntimeError(f'save_questions rejected the ballot face: {r.text[:200]}')
 
   # Upload voters
-  # voters_upload function in views.py
+  # voters_upload function in views.py // elections_url.py
   log(f'POST voters/upload  {n_voters} voters (preview, then confirm)')
   csv_text = voters_gen.build_voter_csv(n_voters)
   s.post(f'/helios/elections/{uuid}/voters/upload',

@@ -55,7 +55,7 @@ def measure_keygen(*, scheme, n_samples=30, log=print):
     with Timer() as t:
       # See in views.py inside election_new = election.generate_trustee(ELGAMAL_PARAMS)
       # See models.py = def generate_trustee(self, params)
-      kp = ELGAMAL_PARAMS.generate_keypair()
+      kp = ELGAMAL_PARAMS.generate_keypair() # Handled by algs.py
     keygen_ns.append(t.ns) # Per iteration recorded in array
 
     with Timer() as t:
