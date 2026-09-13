@@ -178,7 +178,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   em('encrypt', 'stage_wall_time_ns', int(st.wall * 1e9), 'ns',
       {'stage_name': 'encrypt_and_cast', 'operational': True, 'n_ballots': n_cast})
 
-  # Stage 3 - aggregate
+  # Stage 3 - aggregate (server side, just imports functions)
   from drivers import stage3_aggregate
   with console.Stage('STAGE 3 · HOMOMORPHIC AGGREGATION') as st:
     election, votes = stage3_aggregate.load_votes(election_uuid, log=log)
@@ -187,34 +187,21 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     console.detail('verify_p defaults to True upstream; left alone it would fold'
                    '~11 s/ballot of proof checking into "aggregation time"')
     t0 = time.perf_counter() 
-    tally, agg_ns, rss = stage3_aggregate.aggregate(election, votes, log=log)
+    tally, agg_ns = stage3_aggregate.aggregate(election, votes, log=log)
     walls['stage 3 aggregate'] = time.perf_counter() - t0
     em('aggregate', 'aggregation_time_ns', agg_ns, 'ns',
-       {'peak_rss_bytes': rss, 'verify_p': False, 'n_votes': len(votes)})
+       {'verify_p': False, 'n_votes': len(votes)})
     console.metric('aggregation_time_ns', f'{agg_ns / 1e6:.1f}', 'ms',
                    f'{agg_ns / max(len(votes), 1) / 1e6:.2f} ms/ballot')
-    console.metric('peak_rss_bytes', console.size(rss), '')
 
-    # Only run at small N (verify_p=True)
-    if N <= cfg.get('verification_metric_max_n', 0):
-      console.step(f'measuring proof verification separately (N <= '
-                   f'{cfg["verification_metric_max_n"]})')
-      t0 = time.perf_counter()
-      verify_ns = stage3_aggregate.measure_verification(election, votes, log=log)
-      walls['stage 3 verify-pass'] = time.perf_counter() - t0
-      em('aggregate', 'proof_verification_time_ns', verify_ns, 'ns',
-         {'verify_p': True, 'n_votes': len(votes),
-          'note': 'includes aggregation; subtract aggregation_time_ns for pure '
-                  'verification cost'})
-      pure = verify_ns - agg_ns
-      console.metric('proof_verification (pure)', f'{pure / 1e9:.2f}', 's',
-                     f'{pure / max(len(votes), 1) / 1e9:.2f} s/ballot')
-    else:
-      console.detail(f'proof-verification metric skipped — N={N} exceeds '
-                     f'verification_metric_max_n='
-                     f'{cfg.get("verification_metric_max_n", 0)}')
+    # No verify_p=True pass. Production never verifies at tally time: only votes
+    # that already passed CastVote.verify_and_store reach voter.vote at all
+    # (models.py:1231), and the tally view refuses to run while any vote is still
+    # pending. Measuring verification here would price work Helios does not do.
+    console.detail('no verify_p=True pass — production verifies at cast time '
+                   '(Celery), never at tally; see Stage 2 await_verification')
 
-  # Stage 4: decrypt
+  # Stage 4 - decrypt
   from drivers import stage4_decrypt
   with console.Stage('STAGE 4 · DECRYPTION') as st:
     console.step('decrypting the Tally object Stage 3 built')
@@ -250,7 +237,6 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
 
   return {'election_uuid': election_uuid, 'result': d['result'],
           'jsonl': str(emitter.path), 'records': len(records)}
-
 
 def main(argv=None):
   # Parse CLI args

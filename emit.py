@@ -7,10 +7,8 @@ Environment is captured PER RECORD, not per run. Redundancy on purpose.
 import json
 import pathlib
 import platform
-import resource
 import shutil
 import subprocess
-import sys
 import time
 
 import helios_env
@@ -42,6 +40,7 @@ def _chrome_version():
     except Exception:
       return None
   return _tool_version('google-chrome')
+
 
 def env():
   global _env_cache # Cache env here
@@ -110,7 +109,7 @@ class Emitter:
     self.close()
 
 
-# Helios uses UTC; gmtime() func instead of localtime()
+# Helios uses UTC; gmtime() func insteaf of localtime()
 def make_run_id(stamp=None):
   """
   e.g. 2026-08-17T04:22:31Z-a1b2
@@ -129,7 +128,8 @@ def make_run_id(stamp=None):
 # Monotonic
 class Timer:
   """
-  perf_counter_ns stopwatch is monotonic and does not skip when the system clock is adjusted mid-run).
+  perf_counter_ns stopwatch (§3.6/§3.7 use perf_counter_ns explicitly — it is
+  monotonic and does not skip when the system clock is adjusted mid-run).
 
       with Timer() as t:
           ...
@@ -143,7 +143,3 @@ class Timer:
   def __exit__(self, *exc):
     self.ns = time.perf_counter_ns() - self._t0
     return False
-
-def peak_rss_bytes():
-  ru = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-  return ru if sys.platform == 'darwin' else ru * 1024

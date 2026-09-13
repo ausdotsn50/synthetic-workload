@@ -89,8 +89,7 @@ def metric(name, value, unit, note=''):
 
 
 class Stage:
-  """Wall-clock a pipeline 
-   and bracket it with a banner."""
+  """Wall-clock a pipeline stage and bracket it with a banner."""
 
   def __init__(self, name):
     self.name = name
@@ -207,12 +206,6 @@ def summary(records, N, stage_walls):
     metric('aggregation_time_ns', f'{agg[0] / 1e6:.1f}', 'ms',
            f'{agg_per / 1e6:.2f} ms/ballot')
 
-  ver = _vals(records, 'proof_verification_time_ns')
-  if ver and agg:
-    pure = ver[0] - agg[0]
-    metric('proof_verification (pure)', ns(pure), '',
-           f'{pure / max(n_votes or N, 1) / 1e9:.2f} s/ballot')
-
   fac = _vals(records, 'decryption_factor_time_ns')
   if fac:
     metric('decryption_factor_time_ns', f'{fac[0] / 1e6:.1f}', 'ms')
@@ -230,12 +223,6 @@ def summary(records, N, stage_walls):
   if look:
     metric('dlog_lookup_time_ns', f'{look[0] / 1e6:.2f}', 'ms', 'DERIVED')
 
-  rss = None
-  for r in records:
-    rss = r.get('extra', {}).get('peak_rss_bytes') or rss
-  if rss:
-    metric('peak_rss_bytes', size(rss), '')
-
   for r in records:
     if r['metric'] == 'result':
       totals = [sum(q) for q in r['value']] if r['value'] else []
@@ -251,13 +238,10 @@ def summary(records, N, stage_walls):
     _p(f'  {"TOTAL":<22} {dur(total):>10}')
 
   # ---- projection -----------------------------------------------------------
-  # Project whichever engine actually produced the board. Stage 2 encrypts in the
-  # browser now, so prefer those; fall back to node for runs recorded when Stage
-  # 2b populated the board instead.
-  _projection(N, enc_2a or enc_2b, agg_per, per_entry, ballot_bytes, stage_walls)
+  _projection(N, enc_2b, agg_per, per_entry, ballot_bytes, stage_walls)
 
 
-def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
+def _projection(N, enc_2b, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
                 stage_walls):
   """
   Extrapolate this cell's measured per-ballot rates to larger electorates.
@@ -268,7 +252,7 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
   storage is N x ballot size. It is NOT defensible for anything involving memory
   pressure or database growth, which is why those are not projected.
   """
-  if not (enc_samples or agg_per_ns):
+  if not (enc_2b or agg_per_ns):
     return
 
   section('CAPACITY PROJECTION — extrapolated from this cell')
@@ -276,17 +260,13 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
   detail('DB growth and thermal throttling. Treat as an order-of-magnitude gate.')
   _p()
 
-  enc_ms = _mean(enc_samples) if enc_samples else None
+  enc_ms = _mean(enc_2b) if enc_2b else None
   cast_per = None
   if stage_walls and N:
-    # Cast + Celery verification only. Encryption is excluded because it is
+    # Cast + Celery verification only. Node encryption is excluded because it is
     # already projected in its own column; adding it here would double-count.
-    # Stage 2 owns casting now; the 2b keys are kept so runs recorded under the
-    # old split still project instead of silently showing a blank column.
-    cast_wall = ((stage_walls.get('stage 2 cast', 0)
-                  + stage_walls.get('stage 2 verify', 0))
-                 or (stage_walls.get('stage 2b cast', 0)
-                     + stage_walls.get('stage 2b verify', 0)))
+    cast_wall = (stage_walls.get('stage 2b cast', 0)
+                 + stage_walls.get('stage 2b verify', 0))
     cast_per = cast_wall / max(N, 1) if cast_wall else None
 
   hdr = f'  {"N":>9}  {"encrypt":>10}  {"cast+verify":>12}  {"aggregate":>10}  {"dlog":>9}  {"storage":>10}'

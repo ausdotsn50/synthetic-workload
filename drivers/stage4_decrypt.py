@@ -75,7 +75,7 @@ def decrypt(election, tally, log=print):
       f'{t_precompute.ns / 1e6:9.2f} ms  '
       f'({tally.num_tallied} entries, Theta(N))')
   log(f'   remainder lookup + combine             '
-      f'{lookup_ns / 1e6:9.2f} ms  DERIVED')
+      f'{decrypt_and_lookup_ns / 1e6:9.2f} ms  DERIVED')
   log(f'result: {result}')
 
   return {
@@ -83,7 +83,7 @@ def decrypt(election, tally, log=print):
     'decryption_factor_time_ns': t_factors.ns,
     'decryption_combine_time_ns': t_combine.ns,
     'dlog_precompute_time_ns': t_precompute.ns,
-    'dlog_lookup_time_ns': lookup_ns,
+    'dlog_lookup_time_ns': decrypt_and_lookup_ns,
     'dlog_entries': tally.num_tallied,
     'proofs': proofs,
   }

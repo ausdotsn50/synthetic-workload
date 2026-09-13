@@ -12,10 +12,10 @@ seed: 424242
 
 ballot_face: nle2025 # key into config/ballot_face.yaml
 
-# Stage 3 measures aggregation with verify_p=False (§0.4 — otherwise ~11 s/ballot of
-# proof verification hides inside the aggregation figure). Proof verification is
-# measured separately as its own metric, but only at small N, since it is expensive.
-verification_metric_max_n: 100
+# Stage 3 aggregates with verify_p=False, matching Election.compute_tally
+# (helios/models.py:491, "assuming votes already verified"). Verification is real
+# production cost but it is paid at CAST time in Celery, per ballot, not at tally.
+# There is no tally-time verification metric and no max-N gate for one.
 
 # Stage 2a sampled encryption. Pilot at n0, then derive n
 pilot:

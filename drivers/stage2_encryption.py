@@ -32,7 +32,8 @@ def _driver(headless=True):
 # Performance.mark() and Performance.measure() extra object storage
 # performance.now() = https://developer.mozilla.org/en-US/docs/Web/API/Performance/now
 
-# Parse the election ONCE per page load and keep it in page context.
+# Parse the election ONCE per page load and keep it in page context
+# Hashes the whole election
 _LOAD_ELECTION_JS = r"""
 const [electionJson] = arguments;
 window.__workload_election = HELIOS.Election.fromJSONString(electionJson);
@@ -72,7 +73,6 @@ return {
 };
 """
 
-
 def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
                        headless=True, log=print):
   """
@@ -109,6 +109,7 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
         f'HELIOS is undefined after loading {base_url}/booth/vote.html — '
         f'jscrypto did not load. Check the server is serving /booth/.')
     log('booth jscrypto loaded — HELIOS.EncryptedAnswer available')
+
 
     # One parse for the whole run, mirroring a real booth page load.
     n_q = driver.execute_script(_LOAD_ELECTION_JS, election_json)

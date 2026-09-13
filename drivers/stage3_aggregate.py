@@ -25,25 +25,31 @@ byte-identical between the two apart from whitespace, so the aggregation figure
 would have come out the same either way — but that is luck, not a guarantee, and
 Stage 4 crashes outright on the legacy class.
 
-THE verify_p TRAP
------------------
-`Tally.add_vote_batch(encrypted_votes, verify_p=True)` is the DEFAULT signature in
-helios/crypto/electionalgs.py. With it left at the default, every ballot's proofs
-are re-verified before being folded in — measured at ~11 s/ballot (§0.3). At
-N = 10,000 that is 30 hours of proof verification hiding inside a number the
-manuscript labels "aggregation time".
+verify_p=False MATCHES PRODUCTION — it is not a deviation
+---------------------------------------------------------
+`verify_p=True` is the DEFAULT in the function signature, but nothing in Helios
+uses it. `Election.compute_tally` passes verify_p=False explicitly, with the
+docstring "tally the election, assuming votes already verified"
+(helios/models.py:485-491). This stage does the same thing for the same reason.
 
-Table 5 defines aggregation as Helios's homomorphic tally routine — the
-multiplication, not the verification. So this stage passes verify_p=False
-explicitly (§0.4).
+The assumption holds structurally, not by convention. `CastVote.verify_and_store`
+calls `vote.verify(election)` and only calls `voter.store_vote(self)` when it
+passes (models.py:1221-1234) — a ballot that fails verification never reaches
+`voter.vote`, so `voter_set.exclude(vote=None)` cannot return one. On top of that,
+`views.one_election_compute_tally` refuses to tally while `num_pending_votes > 0`.
+By the time anything is aggregated, every ballot has been verified exactly once.
 
-Proof verification is not discarded, though: it is a first-class metric in its own
-right (PART 6 item 3, adopted), and arguably the most interesting one for a
-Paillier-vs-ElGamal comparison because the two proof systems differ structurally.
-It is measured in a separate pass, and only at small N, because it is expensive.
+So verification is real production cost, but it is CAST-time cost, paid per ballot
+in Celery as votes arrive and amortised across the voting period. It is not tally
+cost. A verify_p=True pass here would price work Helios never performs — ~11 s per
+ballot on the NLE face, or 30 hours at N = 10,000, inside a number labelled
+"aggregation time".
+
+Stage 2's `await_verification` is where that cast-time work is visible, since it
+waits for exactly those Celery tasks to drain.
 """
 
-from emit import Timer, peak_rss_bytes
+from emit import Timer
 
 
 def load_votes(election_uuid, log=print):
@@ -67,9 +73,9 @@ def aggregate(election, votes, log=print):
   """
   Time the homomorphic tally.
 
-  Returns (tally, aggregation_ns, peak_rss). The Tally object is returned so
-  Stage 4 can decrypt the very object this stage built — re-deriving it would
-  measure a different computation.
+  Returns (tally, aggregation_ns). The Tally object is returned so Stage 4 can
+  decrypt the very object this stage built — re-deriving it would measure a
+  different computation.
   """
   import helios_env
   helios_env.setup_django()
@@ -77,40 +83,11 @@ def aggregate(election, votes, log=print):
 
   tally = Tally(election=election)
 
-  # add_vote_batch func in helios/workflows/homomorphic
-   """
-    Add a batch of votes.
-    """
+  # add_vote_batch in helios/workflows/homomorphic — "Add a batch of votes."
   with Timer() as t:
     tally.add_vote_batch(votes, verify_p=False) # verify_p=True checks if EACH ballot is well-formed
 
-  # Capture how much memory the process was using at its high-water mark 
-  # How much RAM was spent aggregating
-  rss = peak_rss_bytes() 
   log(f'{len(votes)} ballots in {t.ns / 1e6:.1f} ms '
       f'({t.ns / max(len(votes), 1) / 1e6:.2f} ms/ballot)')
-  return tally, t.ns, rss
+  return tally, t.ns
 
-
-def measure_verification(election, votes, log=print):
-  """
-  Proof verification cost, isolated
-
-  Runs the same aggregation with verify_p=True into a throwaway Tally. The
-  difference against the verify_p=False figure is verification cost, cleanly
-  separated
-
-  Expensive: ~11 s/ballot on the NLE face. Callers gate this on
-  levels.yaml:verification_metric_max_n.
-  """
-  import helios_env
-  helios_env.setup_django()
-  from helios.workflows.homomorphic import Tally
-
-  tally = Tally(election=election)
-  with Timer() as t:
-    tally.add_vote_batch(votes, verify_p=True)
-
-  log(f'verify_p=True pass took {t.ns / 1e9:.1f} s '
-      f'({t.ns / max(len(votes), 1) / 1e9:.2f} s/ballot, aggregation included)')
-  return t.ns
