@@ -27,7 +27,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
              headless=True, skip=()):
   # Usage of seed for reproducibility purposes
   seed_base = cfg['seed']
-  base_url = cfg['helios']['url'].rstrip('/')
+  base_url = helios_env.helios_url()
   helios_path = helios_env.helios_path()
 
   # Import of votes and voters module from generator/
@@ -267,7 +267,7 @@ def main(argv=None):
   face_key = args.face or cfg['ballot_face'] # Curr choices: smoke or nle2025
   face = faces[face_key]
   skip = tuple(x.strip() for x in args.skip.split(',') if x.strip())
-  base_url = cfg['helios']['url'].rstrip('/')
+  base_url = helios_env.helios_url()
 
   # Gate BEFORE any stage runs. Not reachable by --skip: skipping a stage must
   # never be a route to emitting records that claim a scheme this checkout

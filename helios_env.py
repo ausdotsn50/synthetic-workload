@@ -31,6 +31,15 @@ def helios_path():
   return (WORKLOAD_ROOT / cfg['helios']['path']).resolve() # converted to abs url
 
 def helios_url():
+  """
+  URL_HOST env var wins over config/levels.yaml. This is the same variable
+  Django itself reads (settings.py: URL_HOST, default http://localhost:8000),
+  so sourcing one env file (env.sh) configures both the server and the
+  harness — no machine-specific edit to a tracked file required.
+  """
+  env = os.environ.get('URL_HOST')
+  if env:
+    return env.rstrip('/')
   return load_config('levels.yaml')['helios']['url'].rstrip('/')
 
 
