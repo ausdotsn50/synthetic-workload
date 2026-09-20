@@ -239,7 +239,7 @@ def _election_hash(election_uuid):
   return Election.objects.get(uuid=election_uuid).hash
 
 # Await verification formatted derived from Election object
-def await_verification(election_uuid, expected, timeout_s=1800, poll_s=2.0,
+def await_verification(election_uuid, expected, stall_s=120, poll_s=2.0,
                        log=print):
   """
   Cast ballots are verified by a Celery task (tasks.cast_vote_verify_and_store), so
@@ -247,30 +247,66 @@ def await_verification(election_uuid, expected, timeout_s=1800, poll_s=2.0,
   compute a tally while any vote is unverified — so Stage 3 cannot start until this
   drains.
 
-  If this times out the usual cause is no Celery worker: the jobs queue in RabbitMQ
-  and wait indefinitely. Nothing is lost; nothing progresses.
+  Waits on *lack of progress*, not on total elapsed time. The drain is linear in N
+  (measured: ~0.52 s/ballot at --concurrency 1), so any fixed deadline is really a
+  guess about throughput, and the previous flat 1800s went under-budget somewhere
+  around N=4000 — aborting runs that were draining normally and blaming the worker.
+  A healthy queue moves every poll; only a genuinely stuck one goes quiet.
   """
   import helios_env
   helios_env.setup_django()
   from helios.models import Election
 
-  deadline = time.time() + timeout_s
   t0 = time.time()
+  last_progress = t0
   last = None
-  while time.time() < deadline:
+  while True:
     e = Election.objects.get(uuid=election_uuid)
     pending = e.num_pending_votes
     cast = e.voter_set.exclude(vote=None).count()
     if pending == 0 and cast >= expected:
       log(f'{cast}/{expected} verified in {time.time() - t0:.1f}s')
       return cast
+
     state = (pending, cast)
     if state != last: # Different from last printed
       log(f'celery: {cast}/{expected} verified, {pending} pending '
           f'({time.time() - t0:.0f}s elapsed)')
       last = state
+      last_progress = time.time()
+    elif time.time() - last_progress >= stall_s:
+      raise TimeoutError(_stall_diagnosis(e, expected, cast, pending, stall_s))
+
     time.sleep(poll_s)
 
-  raise TimeoutError(
-    f'ballots still pending verification after {timeout_s}s. Is a Celery worker '
-    f'running?')
+
+def _stall_diagnosis(election, expected, cast, pending, stall_s):
+  """
+  A stalled drain has two very different causes and they need different fixes.
+
+  `cast` counts voters whose vote was stored, and store_vote only runs when
+  verification SUCCEEDS. A ballot that fails verification gets invalidated_at set,
+  which drops it out of num_pending_votes without ever reaching voter.vote — so
+  `pending == 0 and cast >= expected` becomes unsatisfiable and the wait can never
+  exit on its own. Quarantined ballots are excluded from the pending count for the
+  same reason. Reporting either as "is a worker running?" sends you after the wrong
+  thing entirely.
+  """
+  from helios.models import CastVote
+
+  votes = CastVote.objects.filter(voter__election=election)
+  invalidated = votes.exclude(invalidated_at=None).count()
+  quarantined = votes.filter(quarantined_p=True).count()
+
+  head = (f'ballot verification stalled: {cast}/{expected} verified, '
+          f'{pending} pending, no change for {stall_s}s.')
+
+  if invalidated or quarantined:
+    return (f'{head} {invalidated} ballot(s) failed verification and '
+            f'{quarantined} are quarantined; neither ever reaches voter.vote, so '
+            f'this run cannot reach {expected} verified. The board is incomplete '
+            f'— this cell should be discarded, not resumed.')
+
+  return (f'{head} No ballot has failed verification, so the queue simply is not '
+          f'draining: check that a Celery worker is running and consuming the '
+          f'"celery" queue.')

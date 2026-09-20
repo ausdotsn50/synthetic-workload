@@ -158,6 +158,10 @@ def _mean(xs):
   return statistics.fmean(xs) if xs else None
 
 
+def _median(xs):
+  return statistics.median(xs) if xs else None
+
+
 def summary(records, N, stage_walls):
   """Print the measured result of one cell, then project it to larger N."""
   section('MEASURED — this cell')
@@ -174,10 +178,10 @@ def summary(records, N, stage_walls):
   enc_2a = _vals(records, 'encryption_time_ms', source='selenium')
   enc_2b = _vals(records, 'encryption_time_ms', source='node')
   if enc_2a:
-    metric('encryption_time_ms (browser)', f'{_mean(enc_2a):.1f}', 'ms/ballot',
+    metric('encryption_time_ms (browser)', f'{_median(enc_2a):.1f}', 'ms/ballot',
            f'n={len(enc_2a)}')
   if enc_2b:
-    metric('encryption_time_ms (node)', f'{_mean(enc_2b):.1f}', 'ms/ballot',
+    metric('encryption_time_ms (node)', f'{_median(enc_2b):.1f}', 'ms/ballot',
            f'n={len(enc_2b)}')
 
   ct = _vals(records, 'ciphertext_bytes', source='node') or \
@@ -185,14 +189,14 @@ def summary(records, N, stage_walls):
   pf = _vals(records, 'proof_bytes', source='node') or \
       _vals(records, 'proof_bytes')
   if ct:
-    metric('ciphertext_bytes (mean)', size(_mean(ct)), '')
+    metric('ciphertext_bytes (median)', size(_median(ct)), '')
   if pf:
-    metric('proof_bytes (mean)', size(_mean(pf)), '')
+    metric('proof_bytes (median)', size(_median(pf)), '')
   ballot_bytes = None
   if ct and pf:
-    ballot_bytes = _mean(ct) + _mean(pf)
-    share = 100 * _mean(pf) / ballot_bytes
-    metric('ballot total (mean)', size(ballot_bytes), '',
+    ballot_bytes = _median(ct) + _median(pf)
+    share = 100 * _median(pf) / ballot_bytes
+    metric('ballot total (median)', size(ballot_bytes), '',
            f'proofs {share:.0f}%')
 
   agg = _vals(records, 'aggregation_time_ns')
@@ -238,10 +242,10 @@ def summary(records, N, stage_walls):
     _p(f'  {"TOTAL":<22} {dur(total):>10}')
 
   # ---- projection -----------------------------------------------------------
-  _projection(N, enc_2b, agg_per, per_entry, ballot_bytes, stage_walls)
+  _projection(N, enc_2a, agg_per, per_entry, ballot_bytes, stage_walls)
 
 
-def _projection(N, enc_2b, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
+def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
                 stage_walls):
   """
   Extrapolate this cell's measured per-ballot rates to larger electorates.
@@ -252,7 +256,7 @@ def _projection(N, enc_2b, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
   storage is N x ballot size. It is NOT defensible for anything involving memory
   pressure or database growth, which is why those are not projected.
   """
-  if not (enc_2b or agg_per_ns):
+  if not (enc_samples or agg_per_ns):
     return
 
   section('CAPACITY PROJECTION — extrapolated from this cell')
@@ -260,13 +264,14 @@ def _projection(N, enc_2b, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
   detail('DB growth and thermal throttling. Treat as an order-of-magnitude gate.')
   _p()
 
-  enc_ms = _mean(enc_2b) if enc_2b else None
+  enc_ms = _mean(enc_samples) if enc_samples else None
   cast_per = None
   if stage_walls and N:
-    # Cast + Celery verification only. Node encryption is excluded because it is
-    # already projected in its own column; adding it here would double-count.
-    cast_wall = (stage_walls.get('stage 2b cast', 0)
-                 + stage_walls.get('stage 2b verify', 0))
+    # Cast (HTTP login+cast+cast_confirm) + Celery verification drain, per
+    # ballot. Browser encryption is excluded because it is already projected
+    # in its own column; adding it here would double-count.
+    cast_wall = (stage_walls.get('stage 2 cast', 0)
+                 + stage_walls.get('stage 2 verify', 0))
     cast_per = cast_wall / max(N, 1) if cast_wall else None
 
   hdr = f'  {"N":>9}  {"encrypt":>10}  {"cast+verify":>12}  {"aggregate":>10}  {"dlog":>9}  {"storage":>10}'

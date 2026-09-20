@@ -102,7 +102,7 @@ def _await_voters(uuid, expected, timeout_s, poll_s, log):
   while time.time() < deadline: # Rmv for later, unnecessary time unit measure
     seen = voters_gen.count_registered(uuid)
     if seen >= expected:
-      log(f'{seen}/{expected} voters registered in {time.time() - t0:.1f}s')
+      log(f'{seen}/{expected} voters registered')
       return
     if seen != last:
       log(f'celery voter_file_process: {seen}/{expected} '

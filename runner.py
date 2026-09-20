@@ -19,6 +19,7 @@ import time
 import console
 import helios_env
 import preflight
+import schemes
 from emit import Emitter, make_run_id
 
 # Cell run equivalent to one election run
@@ -58,7 +59,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   console.field('rep', rep)
   console.field('ballot face', f'{face_key} — {len(questions)} questions, '
                                f'{n_answers} answers')
-  console.field('ciphertexts per ballot', n_answers)
+  console.field('ciphertexts/ballot', n_answers)
   console.field('cell seed', seed)
   console.field('election', short_name)
   console.field('output', emitter.path)
@@ -110,6 +111,8 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
         em('freeze', 'prove_sk_time_ns', v, 'ns', {'sample': i})
       console.metric('keygen_time_ns', f'{sum(keygen_ns) / len(keygen_ns) / 1e6:.2f}',
                      'ms (mean)', f'{len(keygen_ns)} samples emitted')
+      console.metric('prove_sk_time_ns', f'{sum(prove_sk_ns) / len(prove_sk_ns) / 1e6:.2f}',
+                     'ms (mean)', f'{len(prove_sk_ns)} samples emitted')
     else:
       console.warn('keygen sampling skipped')
 
@@ -265,6 +268,16 @@ def main(argv=None):
   face = faces[face_key]
   skip = tuple(x.strip() for x in args.skip.split(',') if x.strip())
   base_url = cfg['helios']['url'].rstrip('/')
+
+  # Gate BEFORE any stage runs. Not reachable by --skip: skipping a stage must
+  # never be a route to emitting records that claim a scheme this checkout
+  # cannot actually execute. See schemes.py.
+  try:
+    schemes.require(scheme)
+  except (schemes.UnsupportedScheme, KeyError) as e:
+    console.section('ABORTED')
+    console.fail(str(e) if isinstance(e, schemes.UnsupportedScheme) else e.args[0])
+    return 2
 
   if not args.no_preflight:
     if not preflight.check(base_url, need_browser=('2a' not in skip),
