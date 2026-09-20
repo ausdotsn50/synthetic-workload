@@ -5,6 +5,7 @@ Environment is captured PER RECORD, not per run. Redundancy on purpose.
 """
 
 import json
+import os
 import pathlib
 import platform
 import shutil
@@ -42,6 +43,19 @@ def _chrome_version():
   return _tool_version('google-chrome')
 
 
+# platform.processor() returns 'x86_64' on Linux — useless for an environment
+# table. This reads the actual model name.
+def _cpu_model():
+  try:
+    with open('/proc/cpuinfo') as f:            # Linux
+      for line in f:
+        if line.startswith('model name'):
+          return line.split(':', 1)[1].strip()
+  except OSError:
+    pass
+  return _tool_version('sysctl', ('-n', 'machdep.cpu.brand_string'))   # macOS
+
+
 def env():
   global _env_cache # Cache env here
   if _env_cache is not None:
@@ -59,6 +73,12 @@ def env():
     'py': platform.python_version(),
     'node': _tool_version('node'),
     'chrome': _chrome_version(),
+    # Which machine, and which cores it was actually allowed to use (§5.3).
+    # affinity is None on macOS — sched_getaffinity is Linux-only.
+    'cpu_model': _cpu_model(),
+    'cores': os.cpu_count(),
+    'affinity': sorted(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else None,
+    'ram_gb': round(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / 1e9, 1),
     'helios_commit': helios_env.git_commit(hp),
     'helios_dirty': helios_env.git_is_dirty(hp),
     'workload_commit': helios_env.git_commit(wp),
@@ -92,6 +112,9 @@ class Emitter:
       'value': value,
       'unit': unit,
       'env': env(),
+      # Outside env(), which is cached once per run — load changes during a run
+      # and is the evidence for whether a cell was measured on a quiet box.
+      'load': list(os.getloadavg()),
       'extra': extra or {},
     }
     self._fh.write(json.dumps(record, separators=(',', ':')) + '\n')
