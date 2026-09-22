@@ -273,7 +273,8 @@ def summary(records, N, stage_walls):
              'POST to task start, wall clock')
 
   # ---- flow tier: what the administrator waits for --------------------------
-  flow_rows = [('flow_aggregate_ns', 'aggregate'),
+  flow_rows = [('flow_cast_ns', 'cast'),
+               ('flow_aggregate_ns', 'aggregate'),
                ('flow_decrypt_factors_ns', 'decrypt'),
                ('flow_combine_ns', 'decrypt, synchronous')]
   if any(_vals(records, m) for m, _ in flow_rows):
@@ -282,11 +283,18 @@ def summary(records, N, stage_walls):
       v = _vals(records, m)
       if not v:
         continue
-      poll = None
+      poll = per_ballot = None
       for r in records:
         if r['metric'] == m:
           poll = r.get('extra', {}).get('poll_interval_ms')
-      note = phase + (f', +/-{poll:.0f} ms poll' if poll else '')
+          per_ballot = r.get('extra', {}).get('per_ballot_ns')
+      note = phase
+      if per_ballot:
+        # flow_cast_ns is the only flow phase that scales with N, so the
+        # per-ballot rate is what transfers to a larger electorate.
+        note += f', {per_ballot / 1e6:.0f} ms/ballot'
+      if poll:
+        note += f', +/-{poll:.0f} ms poll'
       metric(m, f'{v[0] / 1e6:.1f}', 'ms', note)
 
   _decomposition(records)

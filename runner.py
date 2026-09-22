@@ -177,12 +177,24 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     credentials = voters_gen.fetch_credentials(election_uuid)
 
     console.step(f'casting {N} ballots through the real HTTP flow')
-    t0 = time.perf_counter()
+    # perf_counter_ns, matching the other flow metrics; walls is derived from
+    # it so there is one clock read, not two.
+    t0 = time.perf_counter_ns()
     n_cast, payloads = stage2_encryption.cast_ballots(
       base_url=base_url, election_uuid=election_uuid,
       encrypted=stage2_encryption.load_encrypted(out_path),
       credentials=credentials, total=N, log=log)
-    walls['stage 2 cast'] = time.perf_counter() - t0
+    cast_ns = time.perf_counter_ns() - t0
+    walls['stage 2 cast'] = cast_ns / 1e9
+
+    # The cast phase, voter -> server, N times: login, POST /cast, POST
+    # /cast_confirm per voter. Previously this was measured into walls only,
+    # which is operational bookkeeping and excluded from analysis -- so the one
+    # phase the voter actually experiences was absent from the flow tier.
+    em('encrypt', 'flow_cast_ns', cast_ns, 'ns',
+       {'tier': 'flow', 'n_ballots': n_cast,
+        'per_ballot_ns': int(cast_ns / max(n_cast, 1)),
+        'note': 'login + POST /cast + POST /cast_confirm, per voter'})
 
     # What crossed the wire, as opposed to ciphertext_bytes + proof_bytes which
     # count cryptographic content only.
