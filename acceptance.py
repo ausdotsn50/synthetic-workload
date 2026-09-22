@@ -261,6 +261,197 @@ def check(path, expected_n=10):
     else 'present but impossible under this scheme: '
          + ', '.join(sorted(forbidden)))
 
+  # === Option C: instrumented-in-place checks ==============================
+  def _ex(r):
+    return r.get('extra', {})
+
+  def _by(metric, **want):
+    return [r for r in records if r['metric'] == metric
+            and all(_ex(r).get(k) == v for k, v in want.items())]
+
+  instrumented = [r for r in records
+                  if _ex(r).get('source') == 'helios_instrumentation']
+
+  # --- 8.1 instrumentation present ---------------------------------------
+  # Catches HELIOS_MEASURE_PATH unset on the worker, the measure/instrumentation
+  # branch not checked out, or a span dropped in a merge.
+  REQUIRED_INSTRUMENTED = {
+    'keygen_time_ns', 'prove_sk_time_ns', 'aggregation_time_ns',
+    'decryption_factor_time_ns',
+    'decryption_combine_time_ns', 'dlog_precompute_time_ns',
+    'dlog_lookup_time_ns', 'task_compute_tally_ns', 'task_helios_decrypt_ns'}
+  if not instrumented:
+    c.fail('Helios instrumentation present',
+           'no records with source=helios_instrumentation — the sidecar was '
+           'empty or unreadable. Check HELIOS_MEASURE_PATH on BOTH the Django '
+           'process and the Celery worker.')
+  else:
+    missing_i = REQUIRED_INSTRUMENTED - {r['metric'] for r in instrumented}
+    (c.ok if not missing_i else c.fail)(
+      'all instrumented metrics present',
+      f'{len(instrumented)} records from Helios'
+      if not missing_i else 'missing: ' + ', '.join(sorted(missing_i)))
+
+    # --- 8.7 exactly one tally per election ------------------------------
+    aggs = _by('aggregation_time_ns', source='helios_instrumentation')
+    (c.ok if len(aggs) == 1 else c.fail)(
+      'exactly one tally for this election',
+      f'{len(aggs)} aggregation_time_ns record(s)'
+      + ('' if len(aggs) == 1 else ' — the cell tallied more than once, so '
+                                   'every number in it is suspect'))
+
+    # --- 8.3 internal consistency of the combine spans -------------------
+    pre = _by('dlog_precompute_time_ns', source='helios_instrumentation')
+    look = _by('dlog_lookup_time_ns', source='helios_instrumentation')
+    comb = _by('decryption_combine_time_ns', source='helios_instrumentation')
+    if pre and look and comb:
+      s, total = pre[0]['value'] + look[0]['value'], comb[0]['value']
+      scaffold = (total - s) / total if total else 0
+      if s > total:
+        c.fail('precompute + lookup <= combine',
+               f'{s} > {total} — the nested spans exceed the span containing '
+               f'them, which is impossible')
+      elif scaffold > 0.25:
+        c.warn('precompute + lookup ≈ combine',
+               f'{100 * scaffold:.0f}% of combine is loop scaffolding outside '
+               f'both inner spans — expected at small N, shrinking as N grows')
+      else:
+        c.ok('precompute + lookup ≈ combine',
+             f'{100 * scaffold:.0f}% scaffolding')
+
+    # --- 8.4 process separation ------------------------------------------
+    # Aggregation runs in the Celery worker, combine in the web process. Equal
+    # pids mean the flow was not actually exercised across processes.
+    if aggs and comb:
+      pa, pc = _ex(aggs[0]).get('pid'), _ex(comb[0]).get('pid')
+      if pa is None or pc is None:
+        c.warn('worker and web process are distinct', 'pid missing on a record')
+      elif pa != pc:
+        c.ok('worker and web process are distinct',
+             f'aggregation pid {pa}, combine pid {pc}')
+      else:
+        c.fail('worker and web process are distinct',
+               f'both pid {pa} — either Celery ran eagerly in-process (a test '
+               f'configuration, not a real run) or the flow was bypassed')
+
+    # --- 8.5 ordering: flow >= task >= operation -------------------------
+    def _one(metric, **want):
+      v = _by(metric, **want)
+      return v[0]['value'] if v else None
+
+    fa = _one('flow_aggregate_ns')
+    tc = _one('task_compute_tally_ns', source='helios_instrumentation')
+    ag = _one('aggregation_time_ns', source='helios_instrumentation')
+    if None not in (fa, tc, ag):
+      if fa >= tc >= ag:
+        c.ok('flow >= task >= operation (aggregate)',
+             f'{fa / 1e6:.1f} >= {tc / 1e6:.1f} >= {ag / 1e6:.1f} ms  '
+             f'(queue+HTTP {100 * (fa - tc) / fa:.0f}%, '
+             f'framework {100 * (tc - ag) / tc:.0f}%, crypto '
+             f'{100 * ag / fa:.0f}%)')
+      else:
+        c.fail('flow >= task >= operation (aggregate)',
+               f'{fa / 1e6:.1f} / {tc / 1e6:.1f} / {ag / 1e6:.1f} ms — '
+               f'a containing span is shorter than what it contains')
+
+    fc = _one('flow_combine_ns')
+    oc = _one('decryption_combine_time_ns', source='helios_instrumentation')
+    if None not in (fc, oc):
+      (c.ok if fc >= oc else c.fail)(
+        'flow_combine_ns >= decryption_combine_time_ns',
+        f'{fc / 1e6:.1f} ms vs {oc / 1e6:.1f} ms'
+        + ('' if fc >= oc else ' — the phase is shorter than the operation '
+                               'inside it'))
+
+  # --- 8.8 tier and source completeness ----------------------------------
+  untagged = sorted({
+    r['metric'] for r in records
+    if r['unit'] in ('ns', 'ms')
+    and not _ex(r).get('tier') and not _ex(r).get('operational')})
+  (c.ok if not untagged else c.fail)(
+    'every timing carries tier or operational',
+    '' if not untagged else 'untagged: ' + ', '.join(untagged))
+
+  no_source = sorted({
+    r['metric'] for r in records
+    if _ex(r).get('tier') == 'operation' and not _ex(r).get('source')})
+  (c.ok if not no_source else c.fail)(
+    'every operation metric declares a source',
+    '' if not no_source else 'no source: ' + ', '.join(no_source))
+
+  # --- 11.4 load stability across the cell -------------------------------
+  loads = [r['load'][0] for r in records if isinstance(r.get('load'), list) and r['load']]
+  if loads:
+    first, peak = loads[0], max(loads)
+    if peak > 1.5 * max(first, 0.1):
+      c.warn('load stable across the cell',
+             f'1-min load rose from {first:.2f} to {peak:.2f} '
+             f'({peak / max(first, 0.01):.1f}x) — encryption timings are '
+             f'sensitive to this even when operation metrics are not')
+    else:
+      c.ok('load stable across the cell', f'{first:.2f} -> {peak:.2f}')
+
+  # --- ZKP splits: positive and bounded by their parent -------------------
+  # This is the check that catches the regression class directly. The
+  # decryption split vanished once before, when the Pass A module it lived in
+  # stopped being called, and nothing noticed until an adviser asked.
+  for parent, part, derived, unit in (
+      ('encryption_time_ms', 'encryption_only_ms', 'encryption_proof_ms', 'ms'),
+      ('decryption_factor_time_ns', 'decryption_factor_only_ns',
+       'decryption_proof_ns', 'ns')):
+    pv = [r['value'] for r in records if r['metric'] == parent]
+    sv = [r['value'] for r in records if r['metric'] == part]
+    dv = [r['value'] for r in records if r['metric'] == derived]
+    if not pv:
+      continue
+    if not (sv and dv):
+      c.fail(f'{derived} present',
+             f'{parent} is measured but its proof split is missing — '
+             f'processing and ZKP time cannot be separated')
+      continue
+    bad = [x for x in dv if x <= 0]
+    over = [x for x, p in zip(sv, pv) if x > p]
+    if bad:
+      c.fail(f'{derived} positive',
+             f'{len(bad)} non-positive — the proof-free pass was not faster, '
+             f'so the split is noise, not signal')
+    elif over:
+      c.fail(f'{part} < {parent}',
+             f'{len(over)} samples where the proof-free pass was slower')
+    else:
+      share = 100 * sum(dv) / max(sum(pv), 1)
+      c.ok(f'{derived} split valid', f'ZKP is {share:.0f}% of {parent}')
+
+  # --- payload sizes ------------------------------------------------------
+  PAYLOADS = {'cast_payload_bytes', 'election_json_bytes',
+              'encrypted_tally_bytes', 'decryption_factors_bytes',
+              'decryption_proofs_bytes'}
+  present_payloads = PAYLOADS & {r['metric'] for r in records}
+  if present_payloads:
+    missing_p = PAYLOADS - present_payloads
+    (c.ok if not missing_p else c.fail)(
+      'all payload metrics present',
+      f'{len(present_payloads)}/5'
+      if not missing_p else 'missing: ' + ', '.join(sorted(missing_p)))
+
+    # The wire payload must exceed the cryptographic content it wraps: JSON
+    # structure, wrapper fields and form-encoding all add bytes the
+    # ciphertext+proof figure does not describe.
+    cp = [r['value'] for r in records if r['metric'] == 'cast_payload_bytes']
+    ct = [r['value'] for r in records if r['metric'] == 'ciphertext_bytes']
+    pf = [r['value'] for r in records if r['metric'] == 'proof_bytes']
+    if cp and ct and pf:
+      n = min(len(ct), len(pf))
+      worst = max(ct[i] + pf[i] for i in range(n))
+      if min(cp) > worst:
+        c.ok('cast payload exceeds ciphertext+proof',
+             f'{min(cp) / 1024:.1f} KiB on the wire vs '
+             f'{worst / 1024:.1f} KiB of crypto content '
+             f'(+{100 * (min(cp) - worst) / worst:.1f}%)')
+      else:
+        c.fail('cast payload exceeds ciphertext+proof',
+               f'smallest payload {min(cp)} <= largest content {worst}')
+
   bad_env = [r for r in records if not ENV_KEYS <= set(r.get('env', {}))]
   (c.ok if not bad_env else c.fail)(
     'env captured per record (§4.1)',
@@ -303,9 +494,27 @@ def check(path, expected_n=10):
   else:
     c.ok('no tally-time verification, matching Election.compute_tally')
 
-  keygen = [r for r in records if r['metric'] == 'keygen_time_ns']
-  (c.ok if len(keygen) >= 30 else c.fail)(
-    'keygen sampled >= 30 times (§3.3)', f'{len(keygen)} samples')
+  # Key generation is measured inside Helios, once per election, for the key
+  # the election actually used. There is no 30-sample harness population any
+  # more: the distribution comes from repeated cells, and pooling a microbench
+  # with a real-flow measurement would average across two processes.
+  kg = [r for r in records if r['metric'] == 'keygen_time_ns']
+  kg_election = [r for r in kg
+                 if r.get('extra', {}).get('context') == 'election']
+  if not kg:
+    c.fail('keygen recorded', 'no keygen_time_ns record')
+  elif len(kg_election) == 1 and len(kg) == 1:
+    c.ok('keygen recorded once, in the real flow',
+         f'{kg_election[0]["value"] / 1e6:.2f} ms, '
+         f'source={kg_election[0].get("extra", {}).get("source")}')
+  elif not kg_election:
+    c.fail('keygen recorded in the real flow',
+           f'{len(kg)} keygen record(s), none with context=election — the '
+           f'election\'s own key generation was not measured')
+  else:
+    c.warn('keygen recorded once, in the real flow',
+           f'{len(kg)} keygen records ({len(kg_election)} from the election) — '
+           f'expected exactly one per cell')
 
   # --- values are plausible, not merely present --------------------------
   nonpositive = [r for r in records
@@ -332,8 +541,10 @@ def check(path, expected_n=10):
   if spec.has_dlog:
     pre = [r for r in records if r['metric'] == 'dlog_precompute_time_ns']
     if pre and all(r['value'] > 0 for r in pre):
+      n_entries = (pre[0]['extra'].get('dlog_entries')
+                   or pre[0]['extra'].get('num_tallied'))
       c.ok('dlog precompute ran', f'{pre[0]["value"] / 1e6:.1f} ms for '
-                                  f'{pre[0]["extra"].get("dlog_entries")} entries')
+                                  f'{n_entries} entries')
     elif pre:
       c.fail('dlog precompute ran', 'zero time — the Θ(N) step did not execute')
     else:

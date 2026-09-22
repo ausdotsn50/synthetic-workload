@@ -10,6 +10,7 @@ import json
 import math
 import statistics
 import time
+from urllib.parse import urlencode
 
 import console
 
@@ -73,13 +74,52 @@ return {
 };
 """
 
+# Encryption WITHOUT proofs, mirroring HELIOS.EncryptedAnswer.doEncryption
+# (helios.js:262-276) exactly: same zero/one plaintexts, same randomness source,
+# same ElGamal.encrypt call, same answer-index selection. What it omits is
+# generateDisjunctiveProof per choice and the overall proof's homomorphic sum.
+#
+# encryption_time_ms - encryption_only_ms = proof generation. The hom_sum and
+# rand_sum loops fall on the proof side, which is correct -- they exist only to
+# build the overall proof.
+_ENCRYPT_ONLY_JS = r"""
+const [qNum, answerIndexes] = arguments;
+const election = window.__workload_election;
+if (!election) {
+  throw new Error('election missing from page context');
+}
+const q  = election.questions[qNum];
+const pk = election.public_key;
+const zero_one = UTILS.generate_plaintexts(pk, 0, 1);
+
+const t0 = performance.now();
+for (var i = 0; i < q.answers.length; i++) {
+  const idx = _(answerIndexes).include(i) ? 1 : 0;
+  const r = Random.getRandomInteger(pk.q);
+  ElGamal.encrypt(pk, zero_one[idx], r);
+}
+const t1 = performance.now();
+return { timing_ms: t1 - t0 };
+"""
+
+
 def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
-                       headless=True, log=print):
+                       headless=True, split_samples=30, warmup=1, log=print):
   """
   Encrypt `ballots` in a real browser, one record per ballot.
 
-  Returns [{timing_ms, ciphertext_bytes, proof_bytes}], summed across questions so
-  each entry is a whole ballot.
+  Returns (samples, warmup_timings).
+
+  samples is [{timing_ms, ciphertext_bytes, proof_bytes, timing_only_ms}], summed
+  across questions so each entry is a whole ballot. timing_only_ms is 0.0 for
+  ballots beyond `split_samples` -- the proof-free pass costs ~69% extra wall
+  clock, and the split it establishes is a ratio, so it is sampled rather than
+  run on every ballot (spec 10 section 11.1).
+
+  `warmup` ballots are encrypted and discarded before measurement begins: the
+  first ballots of a cell read high against steady state (997/1100/843 ms vs
+  ~675 in the 2026-09-20 calibration). Their timings are returned separately so
+  the caller can emit them tagged operational.
 
   If `out_path` is given, each ballot's encrypted answers are streamed there as
   JSONL -- one object per line, {ballot_index, encrypted_answers} -- as it is
@@ -96,9 +136,12 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
   log(f'launching Chrome ({"headless" if headless else "headed"})')
   driver = _driver(headless=headless) # headless chrome webdriver
   samples = []
+  warmup_timings = []
   out = open(out_path, 'w') if out_path else None
+  # Cap the reporting interval: len//10 gives 20-minute blackouts at N=1000 on
+  # the nle2025 face, which is indistinguishable from a hang.
   prog = console.Progress(len(ballots), 'ballots encrypted',
-                          every=max(1, len(ballots) // 10))
+                          every=max(1, min(len(ballots) // 10, 25)))
   try:
     # The booth page pulls in all of jscrypto. Loading it gives us HELIOS.* in
     # page context without reimplementing the dependency order.
@@ -123,8 +166,32 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
            Q0 picks Q1 pick    Q0 picks   Q1 pick    Q0 picks  Q1 pick
     ]
     """
+    # Warm-up: encrypt and discard. The booth's first encryptions in a fresh
+    # page context read high (JIT warm-up in V8, plus CPU frequency ramp under
+    # the powersave governor). Output is thrown away — these ballots are not
+    # cast and not part of N.
+    if warmup and ballots:
+      log(f'warm-up: encrypting {warmup} ballot(s), discarded')
+      for w in range(warmup):
+        t = 0.0
+        for q_num, answer_indexes in enumerate(ballots[0]):
+          t += driver.execute_script(_ENCRYPT_JS, q_num,
+                                     answer_indexes)['timing_ms']
+        warmup_timings.append(t)
+      log(f'warm-up timings: '
+          f'{", ".join(f"{t:.0f} ms" for t in warmup_timings)}')
+
+    """
+    Visualization for ballots/ballot
+    ballots = [
+            ballot 0                ballot 1                ballot 2
+        [ [1, 3],   [0] ],   [ [0, 2, 4], [2] ],   [ [1],      [1] ],
+           Q0 picks Q1 pick    Q0 picks   Q1 pick    Q0 picks  Q1 pick
+    ]
+    """
     for i, ballot in enumerate(ballots): # Looping over the ballots
-      total = {'timing_ms': 0.0, 'ciphertext_bytes': 0, 'proof_bytes': 0}
+      total = {'timing_ms': 0.0, 'ciphertext_bytes': 0, 'proof_bytes': 0,
+               'timing_only_ms': 0.0, 'split_sampled': i < split_samples}
       answers = []
 
       """
@@ -141,6 +208,12 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
         total['proof_bytes'] += r['proof_bytes']
         answers.append(r['encrypted_answer'])
 
+        # Proof-free second pass, on the first `split_samples` ballots only.
+        # Its output is discarded; the ballot that gets cast is the one above.
+        if total['split_sampled']:
+          ro = driver.execute_script(_ENCRYPT_ONLY_JS, q_num, answer_indexes)
+          total['timing_only_ms'] += ro['timing_ms']
+
       if out: # Once write on jsonl file
         out.write(json.dumps({'ballot_index': i,
                               'encrypted_answers': answers}) + '\n')
@@ -155,7 +228,7 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
   prog.done()
   if out_path:
     log(f'wrote {out_path}')
-  return samples
+  return samples, warmup_timings
 
 
 def load_encrypted(path):
@@ -185,7 +258,7 @@ def cast_ballots(*, base_url, election_uuid, encrypted, credentials, total=None,
   `encrypted` may be a list or the generator from load_encrypted; `total` is the
   expected count, needed for the progress bar when a generator hides len().
 
-  Returns the number successfully cast.
+  Returns (number successfully cast, per-ballot payload sizes).
   """
   from drivers.http_client import HeliosSession
 
@@ -198,13 +271,24 @@ def cast_ballots(*, base_url, election_uuid, encrypted, credentials, total=None,
       f'Stage 0 registered fewer voters than N')
 
   cast = 0
-  prog = console.Progress(n, 'ballots cast', every=max(1, n // 10))
+  payloads = []
+  prog = console.Progress(n, 'ballots cast', every=max(1, min(n // 10, 25)))
   for i, item in enumerate(encrypted):
     login_id, password, _voter_uuid = credentials[i] # From fetched credentials
 
     vote = {'answers': item['encrypted_answers'],
             'election_hash': election_hash,
             'election_uuid': election_uuid}
+
+    # What actually crosses the wire, which ciphertext_bytes + proof_bytes does
+    # not describe: those count cryptographic content only, omitting the JSON
+    # structure, the election_hash/uuid wrapper fields, and form-encoding
+    # expansion. The storage projection based on them understates the board.
+    body = json.dumps(vote)
+    payloads.append({
+      'json_bytes': len(body.encode('utf-8')),
+      'payload_bytes': len(urlencode({'encrypted_vote': body}).encode('utf-8')),
+    })
 
     s = HeliosSession(base_url)
     s.login_voter(election_uuid, login_id, password) # Voter login
@@ -214,7 +298,7 @@ def cast_ballots(*, base_url, election_uuid, encrypted, credentials, total=None,
     # redirect, so `r` is already the cast_confirm page, which renders the
     # csrf_token field. Reading it from there is exactly what a browser does.
     r = s.post(f'/helios/elections/{election_uuid}/cast',
-               data={'encrypted_vote': json.dumps(vote)}, csrf=False)
+               data={'encrypted_vote': body}, csrf=False)
     if not s.learn_csrf(r): # /cast_confirm contains csrf check for that (currently r)
       raise RuntimeError(
         f'no csrf_token on the cast_confirm page for voter {login_id}. '
@@ -229,7 +313,7 @@ def cast_ballots(*, base_url, election_uuid, encrypted, credentials, total=None,
     prog.tick(cast)
 
   prog.done()
-  return cast
+  return cast, payloads
 
 
 def _election_hash(election_uuid):

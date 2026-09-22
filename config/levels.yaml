@@ -5,7 +5,7 @@ schemes:
 levels: # Electoral size/voter count
   - 10
 
-repetitions: 1
+repetitions: 2
 
 # For reproducibility, seed per config election run
 seed: 424242
@@ -30,6 +30,37 @@ pilot:
 bulk:
   pool_size: 5 # Temporarily removed pool_size logic
   stream: false
+
+# Timings are taken inside Helios's own code paths (helios-server branch
+# measure/instrumentation). The harness drives the real flow, polls for phase
+# completion, and joins the sidecar records on election uuid.
+measurement:
+  # FALLBACK ONLY. HELIOS_MEASURE_PATH takes precedence, because that is the
+  # variable Helios itself reads — taking both from one place means the harness
+  # can never look somewhere the writer is not writing.
+  #
+  # Fixed, NOT run-scoped: the Django process and the Celery worker are
+  # long-lived and read the variable once at startup, so a per-run path cannot
+  # reach them. Records carry election_uuid and one cell is one election, so
+  # the join is exact regardless of how many runs share the file.
+  sidecar_path: ~/helios-measure.jsonl
+  poll_s: 0.05        # phase-completion polling. Under Option C this bounds
+                      # the flow_* figures only; the operation and task spans
+                      # are exact, both endpoints being in-process.
+  timeout_s: 3600
+  require_instrumentation: true   # fail the run if sidecar records are missing
+
+# Stage 2 measurement shaping, from the 2026-09-20 calibration run.
+encryption:
+  # The proof-free second pass cost +69% of stage 2 wall time when run on every
+  # ballot (9.97s -> 16.90s at N=5). Sample it instead: the split is a ratio,
+  # and 30 ballots establish it.
+  encrypt_split_samples: 30
+  # The first ballots read high against steady state (997/1100/843 ms vs ~675).
+  # Encrypt and discard this many before measurement begins; they are still
+  # emitted, tagged operational, so they stay in the record and out of the
+  # analysis.
+  warmup_ballots: 1
 
 helios:
   url: http://localhost:8000
