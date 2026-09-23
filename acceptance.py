@@ -275,11 +275,11 @@ def check(path, expected_n=10):
   # --- 8.1 instrumentation present ---------------------------------------
   # Catches HELIOS_MEASURE_PATH unset on the worker, the measure/instrumentation
   # branch not checked out, or a span dropped in a merge.
-  REQUIRED_INSTRUMENTED = {
-    'keygen_time_ns', 'prove_sk_time_ns', 'aggregation_time_ns',
-    'decryption_factor_time_ns',
-    'decryption_combine_time_ns', 'dlog_precompute_time_ns',
-    'dlog_lookup_time_ns', 'task_compute_tally_ns', 'task_helios_decrypt_ns'}
+  # Imported, not duplicated: a local copy drifted once already, leaving
+  # acceptance checking a weaker set than the join required. measure_join is
+  # the single source of truth for what Helios emits, and it imports only json
+  # and os, so acceptance still runs without Django.
+  from drivers.measure_join import REQUIRED_INSTRUMENTED
   if not instrumented:
     c.fail('Helios instrumentation present',
            'no records with source=helios_instrumentation — the sidecar was '
@@ -395,10 +395,11 @@ def check(path, expected_n=10):
   # This is the check that catches the regression class directly. The
   # decryption split vanished once before, when the Pass A module it lived in
   # stopped being called, and nothing noticed until an adviser asked.
+  # Encryption is not in this list: its split is per-ballot and is checked
+  # ballot by ballot below, not in aggregate.
   for parent, part, derived, unit in (
-      ('encryption_time_ms', 'encryption_only_ms', 'encryption_proof_ms', 'ms'),
       ('decryption_factor_time_ns', 'decryption_factor_only_ns',
-       'decryption_proof_ns', 'ns')):
+       'decryption_proof_ns', 'ns'),):
     pv = [r['value'] for r in records if r['metric'] == parent]
     sv = [r['value'] for r in records if r['metric'] == part]
     dv = [r['value'] for r in records if r['metric'] == derived]
@@ -421,6 +422,101 @@ def check(path, expected_n=10):
     else:
       share = 100 * sum(dv) / max(sum(pv), 1)
       c.ok(f'{derived} split valid', f'ZKP is {share:.0f}% of {parent}')
+
+  # --- encryption proof time is real, on every ballot ---------------------
+  # encryption_proof_ms comes from a decorator on the booth's own
+  # generateDisjunctiveProof. The failure mode that matters is not a wrong
+  # number, it is a decorator that never fired: that reports 0.0, and every
+  # share computed from it becomes a claim about work nobody timed. So this
+  # fails, per ballot, rather than warning in aggregate.
+  #
+  # Bounded above by encryption_time_ms for the same reason the decryption
+  # split is: proof generation happens inside the encryption it is part of, so
+  # a proof time that equals or exceeds the whole is a measurement error.
+  def _by_sample(metric_name, **want):
+    out = {}
+    for r in records:
+      if r['metric'] != metric_name:
+        continue
+      e = r.get('extra', {}) or {}
+      if any(e.get(k) != v for k, v in want.items()):
+        continue
+      out[e.get('sample')] = r['value']
+    return out
+
+  enc_total = _by_sample('encryption_time_ms', source='browser')
+  enc_proof = _by_sample('encryption_proof_ms', source='browser')
+  if enc_total and not enc_proof:
+    c.fail('encryption_proof_ms present',
+           'encryption is measured but its proof time is missing — the ZKP '
+           'probe did not run, and the browser side of the ZKP split is gone')
+  elif enc_proof:
+    paired = [(i, enc_proof[i], enc_total[i]) for i in enc_proof
+              if i in enc_total]
+    orphan = [i for i in enc_proof if i not in enc_total]
+    zero = [i for i, p, _t in paired if p <= 0]
+    over = [i for i, p, t in paired if p >= t]
+    if orphan:
+      c.fail('every encryption_proof_ms pairs with a ballot',
+             f'{len(orphan)} sample(s) have proof time but no '
+             f'encryption_time_ms to bound it')
+    elif zero:
+      c.fail('encryption_proof_ms > 0 on every ballot',
+             f'{len(zero)}/{len(paired)} ballot(s) report zero proof time — '
+             f'the probe was installed but never fired, so this metric is '
+             f'fabricated, not measured')
+    elif over:
+      c.fail('encryption_proof_ms < encryption_time_ms on every ballot',
+             f'{len(over)}/{len(paired)} ballot(s) spent at least their whole '
+             f'encryption inside proof generation, which is impossible — the '
+             f'accumulator is not being zeroed per ballot')
+    else:
+      share = 100 * sum(p for _i, p, _t in paired) / sum(
+        t for _i, _p, t in paired)
+      c.ok('encryption proof split valid on every ballot',
+           f'ZKP is {share:.0f}% of encryption_time_ms across '
+           f'{len(paired)} ballot(s)')
+
+  # --- verification split is sane -----------------------------------------
+  # The ZKP table reports verification as essentially all proof checking. That
+  # is now measured: if it drops below 90%, something other than verification
+  # has become expensive and the table's framing needs revisiting.
+  vt = [r['value'] for r in records if r['metric'] == 'verification_time_ns']
+  vo = [r['value'] for r in records if r['metric'] == 'verification_only_ns']
+  if vt and vo:
+    import statistics as _st
+    mt, mo = _st.median(vt), _st.median(vo)
+    if not 0 < mo <= mt:
+      c.fail('verification_only_ns within verification_time_ns',
+             f'{mo / 1e6:.1f} ms vs {mt / 1e6:.1f} ms — the isolated span is '
+             f'not inside the span containing it')
+    elif mo / mt <= 0.90:
+      c.warn('verification is essentially all proof checking',
+             f'proof checking is {100 * mo / mt:.1f}% of verify_and_store — '
+             f'below 90%, so the row writes are no longer negligible')
+    else:
+      c.ok('verification is essentially all proof checking',
+           f'{100 * mo / mt:.1f}% is proof checking, '
+           f'{100 * (mt - mo) / mt:.1f}% row writes')
+
+  # --- aggregation split is sane ------------------------------------------
+  # aggregation_only_ns accumulates around Tally.add_vote inside the
+  # aggregation_time_ns span, so it must be strictly inside it. Zero means the
+  # accumulator never fired and the crypto share would be a claim about work
+  # nobody timed; at or above the parent means it is not measuring what it
+  # says. One tally per cell, so these are single values, not medians.
+  at = [r['value'] for r in records if r['metric'] == 'aggregation_time_ns']
+  ao = [r['value'] for r in records if r['metric'] == 'aggregation_only_ns']
+  if at and ao:
+    pt, po = at[0], ao[0]
+    if not 0 < po < pt:
+      c.fail('aggregation_only_ns within aggregation_time_ns',
+             f'{po / 1e6:.1f} ms vs {pt / 1e6:.1f} ms — the homomorphic '
+             f'multiplication is not strictly inside the loop containing it')
+    else:
+      c.ok('aggregation_only_ns within aggregation_time_ns',
+           f'{100 * po / pt:.1f}% is homomorphic multiplication, '
+           f'{100 * (pt - po) / pt:.1f}% deserialization and row iteration')
 
   # --- payload sizes ------------------------------------------------------
   PAYLOADS = {'cast_payload_bytes', 'election_json_bytes',

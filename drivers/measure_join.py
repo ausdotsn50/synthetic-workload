@@ -25,7 +25,10 @@ STAGE_OF = {
   'keygen_time_ns': 'configure',
   'prove_sk_time_ns': 'configure',
   'verification_time_ns': 'encrypt',
+  'verification_only_ns': 'encrypt',
+  'election_load_time_ns': 'decrypt',
   'aggregation_time_ns': 'aggregate',
+  'aggregation_only_ns': 'aggregate',
   'task_compute_tally_ns': 'aggregate',
   'decryption_factor_time_ns': 'decrypt',
   'decryption_factor_only_ns': 'decrypt',
@@ -41,7 +44,38 @@ STAGE_OF = {
 
 # Timers around a whole Celery task body, as opposed to a single crypto call.
 TASK_METRICS = {'task_compute_tally_ns', 'task_helios_decrypt_ns',
-                'task_start_wall_ns'}
+                'task_start_wall_ns',
+                # Helios's own persistence and row-load work: task tier, not
+                # cryptography, even though both costs are scheme-determined.
+                'election_load_time_ns'}
+
+# Which Helios process records each metric. Not inferred from pid -- this is a
+# static fact about where Helios does the work, and naming the process is far
+# more legible in a summary than a bare pid.
+#
+#   Celery worker  -- compute_tally and tally_helios_decrypt are async tasks,
+#                     and cast verification is a task per ballot
+#   Django web     -- combine_decryptions is synchronous inside the request,
+#                     and generate_trustee runs during the election-creation POST
+PROCESS_OF = {
+  'keygen_time_ns': 'Helios web',
+  'prove_sk_time_ns': 'Helios web',
+  'decryption_combine_time_ns': 'Helios web',
+  'dlog_precompute_time_ns': 'Helios web',
+  'dlog_lookup_time_ns': 'Helios web',
+  'aggregation_time_ns': 'Celery worker',
+  'aggregation_only_ns': 'Celery worker',
+  'decryption_factor_time_ns': 'Celery worker',
+  'decryption_factor_only_ns': 'Celery worker',
+  'verification_time_ns': 'Celery worker',
+  'verification_only_ns': 'Celery worker',
+  'election_load_time_ns': 'Celery worker',
+  'task_compute_tally_ns': 'Celery worker',
+  'task_helios_decrypt_ns': 'Celery worker',
+  'encrypted_tally_bytes': 'Celery worker',
+  'decryption_factors_bytes': 'Celery worker',
+  'decryption_proofs_bytes': 'Celery worker',
+}
 
 # Payload sizes: what crosses the wire or sits on the board, not a duration.
 # They belong to the flow tier -- they describe the system's output, not the
@@ -61,10 +95,13 @@ SKIP_EMIT = {'task_start_wall_ns'}
 # the two processes, or a span was dropped in a merge.
 REQUIRED_INSTRUMENTED = {
   'keygen_time_ns', 'prove_sk_time_ns', 'aggregation_time_ns',
+  'aggregation_only_ns',
   'decryption_factor_time_ns',
   'decryption_combine_time_ns', 'dlog_precompute_time_ns',
   'dlog_lookup_time_ns', 'task_compute_tally_ns', 'task_helios_decrypt_ns',
-  'decryption_factor_only_ns', 'decryption_factors_bytes',
+  'decryption_factor_only_ns', 'verification_only_ns',
+  'election_load_time_ns',
+  'decryption_factors_bytes',
   'decryption_proofs_bytes', 'encrypted_tally_bytes',
 }
 

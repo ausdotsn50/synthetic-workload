@@ -41,6 +41,61 @@ window.__workload_election = HELIOS.Election.fromJSONString(electionJson);
 return window.__workload_election.questions.length;
 """
 
+# ZKP timing probe.
+#
+# Every proof in a ballot is produced by one function:
+# ElGamal.Ciphertext.prototype.generateDisjunctiveProof (elgamal.js:245).
+# doEncryption calls it once per answer slot for the individual proofs
+# (helios.js:280) and once more per question for the overall proof
+# (helios.js:307), so wrapping it captures all ballot proof generation and
+# nothing else.
+#
+# The wrapper calls the original through .apply and returns its value untouched.
+# Helios's own loop still drives the work, the proof that goes into the cast
+# ballot is the real one, and there is no second encryption pass: this is the
+# same shape as the server-side split, where tasks.py times verify_and_store and
+# models.py times self.vote.verify inside it.
+#
+# What falls on the non-proof side is everything doEncryption does around these
+# calls: generate_plaintexts, the ElGamal.encrypt per slot, the hom_sum/rand_sum
+# loops, array construction. The hom_sum loop exists only to feed the overall
+# proof, but it is not proof generation, and moving it across the line would
+# mean judging Helios's code instead of timing it.
+_INSTALL_ZKP_PROBE_JS = r"""
+const proto = (typeof ElGamal !== 'undefined' && ElGamal.Ciphertext)
+    ? ElGamal.Ciphertext.prototype : null;
+if (!proto) {
+  throw new Error('ElGamal.Ciphertext.prototype is not reachable on the booth '
+                  + 'page, so there is nothing to wrap and encryption proof '
+                  + 'time cannot be measured');
+}
+
+const current = proto.generateDisjunctiveProof;
+if (typeof current !== 'function') {
+  throw new Error('ElGamal.Ciphertext.prototype.generateDisjunctiveProof is '
+                  + (typeof current) + ', not a function — this booth build has '
+                  + 'moved the proof entry point, and installing the probe '
+                  + 'anyway would silently measure nothing');
+}
+
+// Idempotent. A second install would nest one wrapper inside the other and
+// bill every proof twice.
+if (window.__workload_zkp) {
+  return {installed: true, already_installed: true};
+}
+
+const acc = {ms: 0.0, calls: 0};
+window.__workload_zkp = acc;
+proto.generateDisjunctiveProof = function() {
+  const s = performance.now();
+  const out = current.apply(this, arguments);
+  acc.ms += performance.now() - s;
+  acc.calls += 1;
+  return out;
+};
+return {installed: true, already_installed: false};
+"""
+
 # See the ff. class in helios.js >> HELIOS.EncryptedAnswer = Class.extend({...})
 _ENCRYPT_JS = r"""
 const [qNum, answerIndexes] = arguments;
@@ -51,11 +106,26 @@ if (!election) {
                   + 'the election under test');
 }
 
+// Zeroed here, not inside the probe, so what is read back below belongs to
+// exactly this EncryptedAnswer and nothing that ran before it.
+const zkp = window.__workload_zkp;
+if (!zkp) {
+  throw new Error('ZKP probe missing from page context — encryption proof time '
+                  + 'would come back as zero, which is a lie rather than a '
+                  + 'measurement');
+}
+zkp.ms = 0.0;
+zkp.calls = 0;
+
 // Triggerred after construction via new HELIOS.EncryptedAnswer
 const t0 = performance.now();
 const ea = new HELIOS.EncryptedAnswer(
     election.questions[qNum], answerIndexes, election.public_key);
 const t1 = performance.now();
+
+// Read immediately, before anything else on this page can call into ElGamal.
+const proof_ms = zkp.ms;
+const proof_calls = zkp.calls;
 
 // Serialization is deliberately AFTER t1: the ballot now travels back to Python
 // so it can be cast, but turning it into JSON is not part of encryption and must
@@ -67,6 +137,8 @@ const json = ea.toJSONObject(false);
 const enc = new TextEncoder();
 return {
   timing_ms: t1 - t0,
+  proof_ms: proof_ms,
+  proof_calls: proof_calls,
   ciphertext_bytes: enc.encode(JSON.stringify(json.choices)).length,
   proof_bytes: enc.encode(
       JSON.stringify([json.individual_proofs, json.overall_proof])).length,
@@ -74,47 +146,21 @@ return {
 };
 """
 
-# Encryption WITHOUT proofs, mirroring HELIOS.EncryptedAnswer.doEncryption
-# (helios.js:262-276) exactly: same zero/one plaintexts, same randomness source,
-# same ElGamal.encrypt call, same answer-index selection. What it omits is
-# generateDisjunctiveProof per choice and the overall proof's homomorphic sum.
-#
-# encryption_time_ms - encryption_only_ms = proof generation. The hom_sum and
-# rand_sum loops fall on the proof side, which is correct -- they exist only to
-# build the overall proof.
-_ENCRYPT_ONLY_JS = r"""
-const [qNum, answerIndexes] = arguments;
-const election = window.__workload_election;
-if (!election) {
-  throw new Error('election missing from page context');
-}
-const q  = election.questions[qNum];
-const pk = election.public_key;
-const zero_one = UTILS.generate_plaintexts(pk, 0, 1);
-
-const t0 = performance.now();
-for (var i = 0; i < q.answers.length; i++) {
-  const idx = _(answerIndexes).include(i) ? 1 : 0;
-  const r = Random.getRandomInteger(pk.q);
-  ElGamal.encrypt(pk, zero_one[idx], r);
-}
-const t1 = performance.now();
-return { timing_ms: t1 - t0 };
-"""
-
-
 def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
-                       headless=True, split_samples=30, warmup=1, log=print):
+                       headless=True, warmup=1, log=print):
   """
   Encrypt `ballots` in a real browser, one record per ballot.
 
   Returns (samples, warmup_timings).
 
-  samples is [{timing_ms, ciphertext_bytes, proof_bytes, timing_only_ms}], summed
-  across questions so each entry is a whole ballot. timing_only_ms is 0.0 for
-  ballots beyond `split_samples` -- the proof-free pass costs ~69% extra wall
-  clock, and the split it establishes is a ratio, so it is sampled rather than
-  run on every ballot (spec 10 section 11.1).
+  samples is [{timing_ms, proof_ms, ciphertext_bytes, proof_bytes}], summed
+  across questions so each entry is a whole ballot. timing_ms covers the booth's
+  own `new HELIOS.EncryptedAnswer` and nothing else -- the operation the voter
+  actually runs, not a harness-side re-creation of its parts.
+
+  proof_ms is the part of timing_ms spent inside Helios's own
+  generateDisjunctiveProof, measured on the same single pass by the probe
+  installed below. Every ballot carries it; there is no second pass to sample.
 
   `warmup` ballots are encrypted and discarded before measurement begins: the
   first ballots of a cell read high against steady state (997/1100/843 ms vs
@@ -158,6 +204,12 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
     n_q = driver.execute_script(_LOAD_ELECTION_JS, election_json)
     log(f'election parsed once into page context — {n_q} questions')
 
+    # Before any encryption, warm-up included: the probe throws rather than
+    # no-opping if the proof entry point is not where it should be.
+    driver.execute_script(_INSTALL_ZKP_PROBE_JS)
+    log('ZKP probe installed on '
+        'ElGamal.Ciphertext.prototype.generateDisjunctiveProof')
+
     """
     Visualization for ballots/ballot
     ballots = [
@@ -190,8 +242,8 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
     ]
     """
     for i, ballot in enumerate(ballots): # Looping over the ballots
-      total = {'timing_ms': 0.0, 'ciphertext_bytes': 0, 'proof_bytes': 0,
-               'timing_only_ms': 0.0, 'split_sampled': i < split_samples}
+      total = {'timing_ms': 0.0, 'proof_ms': 0.0,
+               'ciphertext_bytes': 0, 'proof_bytes': 0}
       answers = []
 
       """
@@ -203,16 +255,22 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
         # The election is already in page context; only the two small arguments
         # cross the WebDriver connection now, instead of the whole election JSON.
         r = driver.execute_script(_ENCRYPT_JS, q_num, answer_indexes)
+
+        # doEncryption generates a disjunctive proof per answer slot, so any
+        # question that encrypted at all made at least one call. Zero means the
+        # wrapper is not on the path being exercised, and proof_ms would be a
+        # fabricated 0.0 -- fail the run here rather than emit it.
+        if not r['proof_calls']:
+          raise RuntimeError(
+            f'ZKP probe recorded no calls while encrypting question {q_num} of '
+            f'ballot {i}. generateDisjunctiveProof was wrapped but never ran, '
+            f'so encryption_proof_ms cannot be measured for this run.')
+
         total['timing_ms'] += r['timing_ms']
+        total['proof_ms'] += r['proof_ms']
         total['ciphertext_bytes'] += r['ciphertext_bytes']
         total['proof_bytes'] += r['proof_bytes']
         answers.append(r['encrypted_answer'])
-
-        # Proof-free second pass, on the first `split_samples` ballots only.
-        # Its output is discarded; the ballot that gets cast is the one above.
-        if total['split_sampled']:
-          ro = driver.execute_script(_ENCRYPT_ONLY_JS, q_num, answer_indexes)
-          total['timing_only_ms'] += ro['timing_ms']
 
       if out: # Once write on jsonl file
         out.write(json.dumps({'ballot_index': i,

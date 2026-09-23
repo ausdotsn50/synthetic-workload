@@ -139,7 +139,6 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     samples, warmup_timings = stage2_encryption.sample_encryptions(
       base_url=base_url, election_uuid=election_uuid, ballots=ballots,
       out_path=out_path, headless=headless,
-      split_samples=enc_cfg.get('encrypt_split_samples', 30),
       warmup=enc_cfg.get('warmup_ballots', 1), log=log)
     walls['stage 2 encrypt'] = time.perf_counter() - t0
 
@@ -156,16 +155,17 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
           {'tier': 'operation', 'source': 'browser', 'sample': i})
       em('encrypt', 'proof_bytes', s['proof_bytes'], 'bytes',
           {'tier': 'operation', 'source': 'browser', 'sample': i})
-      # The proof-free pass runs on the first encrypt_split_samples ballots
-      # only; beyond that there is no split to emit.
-      if s['split_sampled']:
-        em('encrypt', 'encryption_only_ms', s['timing_only_ms'], 'ms',
-            {'tier': 'operation', 'source': 'browser', 'sample': i})
-        em('encrypt', 'encryption_proof_ms',
-            max(s['timing_ms'] - s['timing_only_ms'], 0.0), 'ms',
-            {'tier': 'operation', 'source': 'harness_derived', 'sample': i,
-             'derived': True,
-             'note': 'encryption_time_ms minus encryption_only_ms'})
+      # Measured in flow, on the same single pass as encryption_time_ms: a
+      # decorator on the booth's own generateDisjunctiveProof, so this is
+      # Helios's proof generation, not a re-creation of it.
+      em('encrypt', 'encryption_proof_ms', s['proof_ms'], 'ms',
+          {'tier': 'operation', 'source': 'browser', 'sample': i})
+      # The remainder -- plaintext setup, the ElGamal.encrypt per answer slot,
+      # the homomorphic sum that feeds the overall proof -- is not recorded.
+      # It was encryption_time_ms minus encryption_proof_ms on the same ballot,
+      # both emitted just above under the same sample index, so the third
+      # record held nothing the first two did not, once per ballot. The ZKP
+      # table reports proof time against the encryption containing it instead.
 
     # One liveness line; the values themselves are reported under MEASURED.
     timings = [s['timing_ms'] for s in samples]
@@ -298,9 +298,9 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
                    'absent, Django was started without HELIOS_MEASURE_PATH '
                    'and must be restarted, not just re-exported.')
 
-    # ZKP split, decryption side. The factor-only pass does the same modexp
-    # work without the Chaum-Pedersen proofs, so the remainder is proof
-    # generation — the mirror of encryption_proof_ms on the browser side.
+    # ZKP split, decryption side. decryption_factor_only_ns is timed on the
+    # real pass (a wrapper on sk.decryption_factor), so the remainder is
+    # Chaum-Pedersen proof generation.
     def _first(metric):
       v = rows.get(metric)
       return v[0]['value'] if v else None
@@ -310,6 +310,13 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       em('decrypt', 'decryption_proof_ns', max(ft - fo, 0), 'ns',
          {'tier': 'operation', 'source': 'harness_derived', 'derived': True,
           'note': 'decryption_factor_time_ns minus decryption_factor_only_ns'})
+
+    # Verification split. verification_time_ns encloses verify_and_store, which
+    # is proof checking PLUS two row writes; verification_only_ns isolates the
+    # cryptography. Both are joined above, so the row-write remainder is not
+    # emitted: the metric that used to sit here subtracted one median from
+    # another, which is two different ballots and describes neither. The ZKP
+    # table reports proof checking against verification_time_ns instead.
 
     # Celery dispatch latency: worker task entry minus the harness's POST.
     # Cross-process wall clock, so disclosed as such rather than as a

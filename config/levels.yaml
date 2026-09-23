@@ -52,10 +52,6 @@ measurement:
 
 # Stage 2 measurement shaping, from the 2026-09-20 calibration run.
 encryption:
-  # The proof-free second pass cost +69% of stage 2 wall time when run on every
-  # ballot (9.97s -> 16.90s at N=5). Sample it instead: the split is a ratio,
-  # and 30 ballots establish it.
-  encrypt_split_samples: 30
   # The first ballots read high against steady state (997/1100/843 ms vs ~675).
   # Encrypt and discard this many before measurement begins; they are still
   # emitted, tagged operational, so they stay in the record and out of the
