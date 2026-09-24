@@ -10,9 +10,12 @@ measured.
 What this stage contributes is the OUTER layer: the phase duration, bounded by
 the poll interval. Against the exact in-process spans it decomposes as
 
-    flow - task       = HTTP + Celery queue latency + poll quantization
-    task - operation  = deserialization, ORM, persistence
+    flow - task       = request + queue + worker row load + poll lag
+    task - operation  = building the empty tally + saving it
     operation         = the cryptosystem
+
+Ballot parsing is inside the operation tier, not the task remainder: the loop
+deserializes each ballot as it fetches the row, within aggregation_time_ns.
 
 Why the poll is an EXISTS query
 -------------------------------
@@ -42,10 +45,8 @@ def compute_tally(*, base_url, election_uuid, poll_s=0.05, timeout_s=3600,
   """
   POST /compute_tally, then wait for encrypted_tally to appear.
 
-  Returns {'flow_aggregate_ns', 'poll_interval_ms', 'posted_at', 'signal_ns'}.
-  posted_at is wall clock, for joining against the worker's task_start_wall_ns
-  to get Celery dispatch latency. signal_ns is handed to Stage 4, which times
-  its phase from this point.
+  Returns {'flow_aggregate_ns', 'poll_interval_ms', 'signal_ns'}.
+  signal_ns is handed to Stage 4, which times its phase from this point.
   """
   import helios_env
   helios_env.setup_django()
@@ -66,7 +67,6 @@ def compute_tally(*, base_url, election_uuid, poll_s=0.05, timeout_s=3600,
   s = HeliosSession(base_url).login_devlogin()
   close_stale_connection()
 
-  posted_at = time.time()
   t0 = time.perf_counter_ns()
   # expect_redirect=False: the view redirects to the election page on success.
   # Following it would add a page render to the measured phase.
@@ -79,6 +79,5 @@ def compute_tally(*, base_url, election_uuid, poll_s=0.05, timeout_s=3600,
   return {
     'flow_aggregate_ns': t1 - t0,
     'poll_interval_ms': poll_s * 1000,
-    'posted_at': posted_at,
     'signal_ns': t1,
   }

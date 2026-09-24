@@ -18,7 +18,6 @@ is now DIRECTLY MEASURED rather than derived:
   decryption_factor_time_ns    alpha^x + Chaum-Pedersen proofs, in the worker
   dlog_precompute_time_ns      DLogTable.precompute -- Theta(N)
   dlog_lookup_time_ns          per-cell decrypt() + the O(1) lookups
-  decryption_combine_time_ns   the whole combine, containing the two above
 
 That structure is the point of the thesis: Helios walks g^0..g^N into a dict
 rather than using BSGS, so ElGamal's decryption grows linearly with the number
@@ -55,7 +54,8 @@ def await_factors(*, election_uuid, since_ns, poll_s=0.05, timeout_s=3600,
   tally appeared to the moment the factors do. No POST is issued here -- the
   task was already triggered by Stage 3's /compute_tally.
 
-  Returns {'flow_decrypt_factors_ns', 'signal_ns'}.
+  Returns {'signal_ns'}. The wait itself is the point: combine must not run
+  before the factors exist.
   """
   import helios_env
   helios_env.setup_django()
@@ -63,7 +63,7 @@ def await_factors(*, election_uuid, since_ns, poll_s=0.05, timeout_s=3600,
   close_stale_connection()
   t2 = await_signal(lambda: _factors_present(election_uuid),
                     poll_s, timeout_s, 'decryption_factors', since_ns, log)
-  return {'flow_decrypt_factors_ns': t2 - since_ns, 'signal_ns': t2}
+  return {'signal_ns': t2}
 
 
 def combine(*, base_url, election_uuid, log=print):

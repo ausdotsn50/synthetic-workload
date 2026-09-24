@@ -36,15 +36,12 @@ STAGE_OF = {
   'decryption_proofs_bytes': 'decrypt',
   'encrypted_tally_bytes': 'aggregate',
   'task_helios_decrypt_ns': 'decrypt',
-  'decryption_combine_time_ns': 'decrypt',
   'dlog_precompute_time_ns': 'decrypt',
   'dlog_lookup_time_ns': 'decrypt',
-  'task_start_wall_ns': 'aggregate',
 }
 
 # Timers around a whole Celery task body, as opposed to a single crypto call.
 TASK_METRICS = {'task_compute_tally_ns', 'task_helios_decrypt_ns',
-                'task_start_wall_ns',
                 # Helios's own persistence and row-load work: task tier, not
                 # cryptography, even though both costs are scheme-determined.
                 'election_load_time_ns'}
@@ -60,7 +57,6 @@ TASK_METRICS = {'task_compute_tally_ns', 'task_helios_decrypt_ns',
 PROCESS_OF = {
   'keygen_time_ns': 'Helios web',
   'prove_sk_time_ns': 'Helios web',
-  'decryption_combine_time_ns': 'Helios web',
   'dlog_precompute_time_ns': 'Helios web',
   'dlog_lookup_time_ns': 'Helios web',
   'aggregation_time_ns': 'Celery worker',
@@ -83,12 +79,8 @@ PROCESS_OF = {
 PAYLOAD_METRICS = {'decryption_factors_bytes', 'decryption_proofs_bytes',
                    'encrypted_tally_bytes'}
 
-# Not emitted as measurements. task_start_wall_ns is a marker: its value is 0
-# and all of its information lives in `started_at`, which the harness turns
-# into celery_dispatch_ns. Emitting it would put a zero-valued "timing" in the
-# record set, which is both meaningless and a false positive for the
-# all-timings-positive check.
-SKIP_EMIT = {'task_start_wall_ns'}
+# Sidecar metrics the harness reads but does not emit. Empty for now.
+SKIP_EMIT = set()
 
 # What a correctly instrumented ElGamal cell must contain. Missing any of these
 # means the branch is not checked out, HELIOS_MEASURE_PATH is unset on one of
@@ -96,8 +88,7 @@ SKIP_EMIT = {'task_start_wall_ns'}
 REQUIRED_INSTRUMENTED = {
   'keygen_time_ns', 'prove_sk_time_ns', 'aggregation_time_ns',
   'aggregation_only_ns',
-  'decryption_factor_time_ns',
-  'decryption_combine_time_ns', 'dlog_precompute_time_ns',
+  'decryption_factor_time_ns', 'dlog_precompute_time_ns',
   'dlog_lookup_time_ns', 'task_compute_tally_ns', 'task_helios_decrypt_ns',
   'decryption_factor_only_ns', 'verification_only_ns',
   'election_load_time_ns',
@@ -144,20 +135,3 @@ def extra_for(row):
   extra['tier'] = tier_of(row['metric'])
   extra['source'] = 'helios_instrumentation'
   return extra
-
-
-def dispatch_latency_ns(rows, posted_at):
-  """
-  Celery dispatch latency: worker task entry minus the harness's POST.
-
-  Cross-process wall clock, so accurate to clock resolution rather than
-  perf_counter precision. Both processes are on one machine. Returns a dict of
-  {task_name: ns}, or {} when the sidecar has no task_start_wall_ns.
-  """
-  out = {}
-  for row in rows.get('task_start_wall_ns', []):
-    started = row.get('started_at')
-    if started is None or posted_at is None:
-      continue
-    out[row.get('task', '?')] = int((started - posted_at) * 1e9)
-  return out

@@ -291,16 +291,6 @@ def summary(records, N, stage_walls):
            _note(records, 'decryption_factor_only_ns',
                  f'{100 * fac_only[0] / fac[0]:.0f}% of the loop',
                  'factors alone'))
-  # The whole combine_decryptions body, run in the web process and synchronous
-  # inside the request. Printed above its two children because it exists to
-  # bound them: precompute + lookup should account for it, and a gap that opens
-  # between them is work nobody is timing.
-  comb = _vals(records, 'decryption_combine_time_ns')
-  if comb:
-    metric('decryption_combine_time_ns', f'{comb[0] / 1e6:.2f}', 'ms',
-           _note(records, 'decryption_combine_time_ns',
-                 'precompute + lookup below'))
-
   pre = _vals(records, 'dlog_precompute_time_ns')
   per_entry = None
   if pre:
@@ -312,15 +302,13 @@ def summary(records, N, stage_walls):
     per_entry = pre[0] / max(entries or N, 1)
     metric('dlog_precompute_time_ns', f'{pre[0] / 1e6:.2f}', 'ms',
            _note(records, 'dlog_precompute_time_ns',
-                 f'{per_entry / 1e3:.1f} µs/entry', f'{entries} entries',
-                 f'{100 * pre[0] / comb[0]:.0f}% of combine' if comb else ''))
+                 f'{per_entry / 1e3:.1f} µs/entry', f'{entries} entries'))
   look = _vals(records, 'dlog_lookup_time_ns')
   if look:
     # Directly measured inside decrypt_from_factors, not derived by
     # subtracting precompute from combine as it was before Option C.
     metric('dlog_lookup_time_ns', f'{look[0] / 1e6:.2f}', 'ms',
-           _note(records, 'dlog_lookup_time_ns', 'directly measured',
-                 f'{100 * look[0] / comb[0]:.0f}% of combine' if comb else ''))
+           _note(records, 'dlog_lookup_time_ns', 'directly measured'))
 
   v = _vals(records, 'verification_time_ns')
   if v:
@@ -353,15 +341,10 @@ def summary(records, N, stage_walls):
         _task = (r.get('extra') or {}).get('task', '')
         metric('election_load_time_ns', f'{r["value"] / 1e6:.1f}', 'ms',
                f'{_task}, outside the task span')
-    v = _vals(records, 'celery_dispatch_ns')
-    if v:
-      metric('celery_dispatch_ns', f'{v[0] / 1e6:.1f}', 'ms',
-             'POST to task start, wall clock')
 
   # ---- flow tier: what the administrator waits for --------------------------
   flow_rows = [('flow_cast_ns', 'cast'),
                ('flow_aggregate_ns', 'aggregate'),
-               ('flow_decrypt_factors_ns', 'decrypt'),
                ('flow_combine_ns', 'decrypt, synchronous')]
   if any(_vals(records, m) for m, _ in flow_rows):
     subsection('flow tier — POST to completion observed')

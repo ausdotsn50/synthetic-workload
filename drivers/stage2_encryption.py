@@ -342,7 +342,9 @@ def cast_ballots(*, base_url, election_uuid, encrypted, credentials, total=None,
     # not describe: those count cryptographic content only, omitting the JSON
     # structure, the election_hash/uuid wrapper fields, and form-encoding
     # expansion. The storage projection based on them understates the board.
-    body = json.dumps(vote)
+    # Compact separators, matching the booth's JSON.stringify: without them
+    # json.dumps adds a space after every ',' and ':'.
+    body = json.dumps(vote, separators=(',', ':'))
     payloads.append({
       'json_bytes': len(body.encode('utf-8')),
       'payload_bytes': len(urlencode({'encrypted_vote': body}).encode('utf-8')),

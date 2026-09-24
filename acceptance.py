@@ -300,35 +300,17 @@ def check(path, expected_n=10):
       + ('' if len(aggs) == 1 else ' — the cell tallied more than once, so '
                                    'every number in it is suspect'))
 
-    # --- 8.3 internal consistency of the combine spans -------------------
-    pre = _by('dlog_precompute_time_ns', source='helios_instrumentation')
-    look = _by('dlog_lookup_time_ns', source='helios_instrumentation')
-    comb = _by('decryption_combine_time_ns', source='helios_instrumentation')
-    if pre and look and comb:
-      s, total = pre[0]['value'] + look[0]['value'], comb[0]['value']
-      scaffold = (total - s) / total if total else 0
-      if s > total:
-        c.fail('precompute + lookup <= combine',
-               f'{s} > {total} — the nested spans exceed the span containing '
-               f'them, which is impossible')
-      elif scaffold > 0.25:
-        c.warn('precompute + lookup ≈ combine',
-               f'{100 * scaffold:.0f}% of combine is loop scaffolding outside '
-               f'both inner spans — expected at small N, shrinking as N grows')
-      else:
-        c.ok('precompute + lookup ≈ combine',
-             f'{100 * scaffold:.0f}% scaffolding')
-
     # --- 8.4 process separation ------------------------------------------
-    # Aggregation runs in the Celery worker, combine in the web process. Equal
-    # pids mean the flow was not actually exercised across processes.
-    if aggs and comb:
-      pa, pc = _ex(aggs[0]).get('pid'), _ex(comb[0]).get('pid')
+    # Aggregation runs in the Celery worker, the dlog work in the web process.
+    # Equal pids mean the flow was not actually exercised across processes.
+    web = _by('dlog_lookup_time_ns', source='helios_instrumentation')
+    if aggs and web:
+      pa, pc = _ex(aggs[0]).get('pid'), _ex(web[0]).get('pid')
       if pa is None or pc is None:
         c.warn('worker and web process are distinct', 'pid missing on a record')
       elif pa != pc:
         c.ok('worker and web process are distinct',
-             f'aggregation pid {pa}, combine pid {pc}')
+             f'aggregation pid {pa}, dlog pid {pc}')
       else:
         c.fail('worker and web process are distinct',
                f'both pid {pa} — either Celery ran eagerly in-process (a test '
@@ -355,13 +337,15 @@ def check(path, expected_n=10):
                f'a containing span is shorter than what it contains')
 
     fc = _one('flow_combine_ns')
-    oc = _one('decryption_combine_time_ns', source='helios_instrumentation')
-    if None not in (fc, oc):
-      (c.ok if fc >= oc else c.fail)(
-        'flow_combine_ns >= decryption_combine_time_ns',
-        f'{fc / 1e6:.1f} ms vs {oc / 1e6:.1f} ms'
-        + ('' if fc >= oc else ' — the phase is shorter than the operation '
-                               'inside it'))
+    pre_ns = _one('dlog_precompute_time_ns', source='helios_instrumentation')
+    look_ns = _one('dlog_lookup_time_ns', source='helios_instrumentation')
+    if None not in (fc, pre_ns, look_ns):
+      inner = pre_ns + look_ns
+      (c.ok if fc >= inner else c.fail)(
+        'flow_combine_ns >= dlog precompute + lookup',
+        f'{fc / 1e6:.1f} ms vs {inner / 1e6:.1f} ms'
+        + ('' if fc >= inner else ' — the phase is shorter than the operations '
+                                  'inside it'))
 
   # --- 8.8 tier and source completeness ----------------------------------
   untagged = sorted({
@@ -414,11 +398,12 @@ def check(path, expected_n=10):
     over = [x for x, p in zip(sv, pv) if x > p]
     if bad:
       c.fail(f'{derived} positive',
-             f'{len(bad)} non-positive — the proof-free pass was not faster, '
-             f'so the split is noise, not signal')
+             f'{len(bad)} non-positive — factors alone were not faster than '
+             f'factors plus proofs, so the split is noise, not signal')
     elif over:
       c.fail(f'{part} < {parent}',
-             f'{len(over)} samples where the proof-free pass was slower')
+             f'{len(over)} samples where factors alone exceeded the loop '
+             f'containing them')
     else:
       share = 100 * sum(dv) / max(sum(pv), 1)
       c.ok(f'{derived} split valid', f'ZKP is {share:.0f}% of {parent}')

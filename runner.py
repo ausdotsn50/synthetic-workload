@@ -90,19 +90,6 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   em('configure', 'stage_wall_time_ns', int(stg_zero.wall * 1e9), 'ns',
      {'stage_name': 'configure', 'operational': True})
 
-  # What every voter's browser downloads before it can render a ballot. The
-  # endpoint already exists (views.one_election), so this needs no Helios
-  # change -- it is measured by asking for it exactly as a booth would.
-  try:
-    from drivers.http_client import HeliosSession
-    _r = HeliosSession(base_url).get(f'/helios/elections/{election_uuid}')
-    em('configure', 'election_json_bytes', len(_r.content), 'bytes',
-       {'tier': 'flow', 'source': 'harness',
-        'note': 'GET /helios/elections/<uuid> — the booth download'})
-  except Exception as e:
-    console.warn(f'could not measure election JSON payload: '
-                 f'{type(e).__name__}: {e}')
-
   # Stage 1 - freeze election
   from drivers import stage1_freeze
   with console.Stage('STAGE 1 · FREEZE') as st:
@@ -118,6 +105,21 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     t0 = time.perf_counter()
     stage1_freeze.freeze(base_url=base_url, election_uuid=election_uuid, log=log)
     walls['stage 1 freeze'] = time.perf_counter() - t0
+
+    # What every voter's browser downloads before it can render a ballot. The
+    # endpoint already exists (views.one_election), so this needs no Helios
+    # change -- it is measured by asking for it exactly as a booth would.
+    # Taken AFTER the freeze: before it, public_key is still null, so the
+    # measured payload would be missing the key the booth needs.
+    try:
+      from drivers.http_client import HeliosSession
+      _r = HeliosSession(base_url).get(f'/helios/elections/{election_uuid}')
+      em('freeze', 'election_json_bytes', len(_r.content), 'bytes',
+         {'tier': 'flow', 'source': 'harness',
+          'note': 'GET /helios/elections/<uuid> — the booth download'})
+    except Exception as e:
+      console.warn(f'could not measure election JSON payload: '
+                   f'{type(e).__name__}: {e}')
   em('freeze', 'frozen', 1, 'count', {'election_uuid': election_uuid})
 
   # Stage 2 - browser encryption, measured, then cast to the board
@@ -243,7 +245,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     console.step('waiting for decryption_factors')
     console.detail('the task was already chained off Stage 3\'s POST — no '
                    'second request is issued here')
-    f4 = stage4_decrypt.await_factors(
+    stage4_decrypt.await_factors(
       election_uuid=election_uuid, since_ns=f3['signal_ns'],
       poll_s=poll_s, timeout_s=timeout_s, log=log)
 
@@ -255,8 +257,6 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   em('aggregate', 'flow_aggregate_ns', f3['flow_aggregate_ns'], 'ns',
      {'tier': 'flow', 'poll_interval_ms': f3['poll_interval_ms'],
       'n_votes': n_cast})
-  em('decrypt', 'flow_decrypt_factors_ns', f4['flow_decrypt_factors_ns'], 'ns',
-     {'tier': 'flow', 'poll_interval_ms': f3['poll_interval_ms']})
   em('decrypt', 'flow_combine_ns', combine_ns, 'ns',
      {'tier': 'flow', 'synchronous': True})
   em('decrypt', 'result', flow_result, 'tally', {'election_uuid': election_uuid})
@@ -294,7 +294,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     if len(_pids) < 2:
       console.warn('all records from a single process — expected two (Django '
                    'web + Celery worker). The web process records keygen, '
-                   'prove_sk, combine and both dlog metrics; if those are '
+                   'prove_sk and both dlog metrics; if those are '
                    'absent, Django was started without HELIOS_MEASURE_PATH '
                    'and must be restarted, not just re-exported.')
 
@@ -317,14 +317,6 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     # emitted: the metric that used to sit here subtracted one median from
     # another, which is two different ballots and describes neither. The ZKP
     # table reports proof checking against verification_time_ns instead.
-
-    # Celery dispatch latency: worker task entry minus the harness's POST.
-    # Cross-process wall clock, so disclosed as such rather than as a
-    # perf_counter quantity.
-    for task, ns in measure_join.dispatch_latency_ns(rows, f3['posted_at']).items():
-      em('aggregate', 'celery_dispatch_ns', ns, 'ns',
-         {'tier': 'flow', 'task': task, 'source': 'harness_derived',
-          'clock': 'wall', 'note': 'task_start_wall_ns.started_at minus POST'})
 
   # Summary of results
   console.summary(records, N, walls)
