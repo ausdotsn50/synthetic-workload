@@ -1,32 +1,22 @@
 """
 Stage 3 — homomorphic aggregation, driven through Helios's own endpoint.
 
-The harness POSTs /compute_tally and waits for the encrypted_tally signal. The
-aggregation itself is timed from INSIDE Helios (helios/measure.py, branch
-measure/instrumentation) and reaches the harness through the sidecar, joined on
-election uuid -- see drivers/measure_join.py. Nothing is re-executed here to be
-measured.
-
-What this stage contributes is the OUTER layer: the phase duration, bounded by
-the poll interval. Against the exact in-process spans it decomposes as
-
-    flow - task       = request + queue + worker row load + poll lag
-    task - operation  = building the empty tally + saving it
-    operation         = the cryptosystem
-
-Ballot parsing is inside the operation tier, not the task remainder: the loop
-deserializes each ballot as it fetches the row, within aggregation_time_ns.
+This stage drives the phase and waits for its signal: it POSTs /compute_tally
+and polls until encrypted_tally appears. It times nothing. The aggregation is
+timed inside Helios (helios/measure.py, branch measure/instrumentation) and
+reaches the harness through the sidecar, joined on election uuid -- see
+drivers/measure_join.py.
 
 Why the poll is an EXISTS query
 -------------------------------
 election.encrypted_tally is an LDObjectField: touching it deserializes the
 whole tally (222 ciphertexts at the nle2025 face). Polling the attribute would
-put that cost inside the measured window, and the poll that finally succeeds
-would pay a full deserialization before the clock is read. The predicate below
-asks the database whether the column is non-NULL and never transfers the value.
+repeat that work every 50 ms on the same machine as the worker being timed. The
+predicate below asks the database whether the column is non-NULL and never
+transfers the value.
 
 NOTE ON SCOPE: the single POST this stage makes also triggers the chained
-tally_helios_decrypt task, so it starts the phase Stage 4 measures. Stage 4
+tally_helios_decrypt task, so it starts the phase Stage 4 waits on. Stage 4
 waits for that second signal; it must NOT issue a second POST.
 """
 
@@ -45,8 +35,8 @@ def compute_tally(*, base_url, election_uuid, poll_s=0.05, timeout_s=3600,
   """
   POST /compute_tally, then wait for encrypted_tally to appear.
 
-  Returns {'flow_aggregate_ns', 'poll_interval_ms', 'signal_ns'}.
-  signal_ns is handed to Stage 4, which times its phase from this point.
+  Returns {'signal_ns'}: when the tally appeared. Stage 4 uses it only for its
+  progress log.
   """
   import helios_env
   helios_env.setup_django()
@@ -67,17 +57,13 @@ def compute_tally(*, base_url, election_uuid, poll_s=0.05, timeout_s=3600,
   s = HeliosSession(base_url).login_devlogin()
   close_stale_connection()
 
+  # t0 feeds only the "waiting on ..." progress log.
   t0 = time.perf_counter_ns()
-  # expect_redirect=False: the view redirects to the election page on success.
-  # Following it would add a page render to the measured phase.
+  # expect_redirect=False: the view redirects to the election page on success,
+  # and rendering it is not needed.
   s.post(f'/helios/elections/{election_uuid}/compute_tally',
          data={}, expect_redirect=False)
 
   t1 = await_signal(lambda: _tally_present(election_uuid),
                     poll_s, timeout_s, 'encrypted_tally', t0, log)
-
-  return {
-    'flow_aggregate_ns': t1 - t0,
-    'poll_interval_ms': poll_s * 1000,
-    'signal_ns': t1,
-  }
+  return {'signal_ns': t1}

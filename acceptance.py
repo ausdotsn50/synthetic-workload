@@ -24,6 +24,11 @@ import schemes
 REQUIRED_STAGES = {'configure', 'freeze', 'encrypt',
                    'aggregate', 'decrypt'}
 
+# stage_name of each stage_wall_time_ns record runner.py emits.
+STAGE_WALLS = {'stage 0 configure', 'stage 1 freeze', 'stage 2 encrypt',
+               'stage 2 cast', 'stage 2 verify', 'stage 3 aggregate',
+               'stage 4 decrypt'}
+
 # Required metrics are SCHEME-DEPENDENT (build spec §8.3). The dlog metrics
 # belong to ElGamal alone; requiring them of a Paillier run would fail a correct
 # run, which is how a guard turns into an obstacle. See schemes.required_metrics.
@@ -286,9 +291,10 @@ def check(path, expected_n=10):
            'empty or unreadable. Check HELIOS_MEASURE_PATH on BOTH the Django '
            'process and the Celery worker.')
   else:
-    missing_i = REQUIRED_INSTRUMENTED - {r['metric'] for r in instrumented}
+    required_i = REQUIRED_INSTRUMENTED - schemes.forbidden_metrics(scheme)
+    missing_i = required_i - {r['metric'] for r in instrumented}
     (c.ok if not missing_i else c.fail)(
-      'all instrumented metrics present',
+      f'all instrumented metrics present (for {scheme})',
       f'{len(instrumented)} records from Helios'
       if not missing_i else 'missing: ' + ', '.join(sorted(missing_i)))
 
@@ -316,37 +322,6 @@ def check(path, expected_n=10):
                f'both pid {pa} — either Celery ran eagerly in-process (a test '
                f'configuration, not a real run) or the flow was bypassed')
 
-    # --- 8.5 ordering: flow >= task >= operation -------------------------
-    def _one(metric, **want):
-      v = _by(metric, **want)
-      return v[0]['value'] if v else None
-
-    fa = _one('flow_aggregate_ns')
-    tc = _one('task_compute_tally_ns', source='helios_instrumentation')
-    ag = _one('aggregation_time_ns', source='helios_instrumentation')
-    if None not in (fa, tc, ag):
-      if fa >= tc >= ag:
-        c.ok('flow >= task >= operation (aggregate)',
-             f'{fa / 1e6:.1f} >= {tc / 1e6:.1f} >= {ag / 1e6:.1f} ms  '
-             f'(queue+HTTP {100 * (fa - tc) / fa:.0f}%, '
-             f'framework {100 * (tc - ag) / tc:.0f}%, crypto '
-             f'{100 * ag / fa:.0f}%)')
-      else:
-        c.fail('flow >= task >= operation (aggregate)',
-               f'{fa / 1e6:.1f} / {tc / 1e6:.1f} / {ag / 1e6:.1f} ms — '
-               f'a containing span is shorter than what it contains')
-
-    fc = _one('flow_combine_ns')
-    pre_ns = _one('dlog_precompute_time_ns', source='helios_instrumentation')
-    look_ns = _one('dlog_lookup_time_ns', source='helios_instrumentation')
-    if None not in (fc, pre_ns, look_ns):
-      inner = pre_ns + look_ns
-      (c.ok if fc >= inner else c.fail)(
-        'flow_combine_ns >= dlog precompute + lookup',
-        f'{fc / 1e6:.1f} ms vs {inner / 1e6:.1f} ms'
-        + ('' if fc >= inner else ' — the phase is shorter than the operations '
-                                  'inside it'))
-
   # --- 8.8 tier and source completeness ----------------------------------
   untagged = sorted({
     r['metric'] for r in records
@@ -362,6 +337,29 @@ def check(path, expected_n=10):
   (c.ok if not no_source else c.fail)(
     'every operation metric declares a source',
     '' if not no_source else 'no source: ' + ', '.join(no_source))
+
+  # Measurements only: anything derivable is computed at print time.
+  derived = sorted({
+    r['metric'] for r in records
+    if _ex(r).get('derived') is True
+    or _ex(r).get('source') == 'harness_derived'})
+  (c.ok if not derived else c.fail)(
+    'no derived records emitted',
+    '' if not derived else 'derived: ' + ', '.join(derived))
+
+  # The console re-prints WALL CLOCK and the projection from these alone.
+  walls = [_ex(r).get('stage_name') for r in records
+           if r['metric'] == 'stage_wall_time_ns']
+  missing_w = STAGE_WALLS - set(walls)
+  extra_w = sorted(set(walls) - STAGE_WALLS, key=str)
+  name_w = f'all {len(STAGE_WALLS)} stage walls present'
+  if not missing_w and not extra_w and len(walls) == len(STAGE_WALLS):
+    c.ok(name_w, f'{len(walls)} stage_wall_time_ns records')
+  else:
+    c.fail(name_w,
+           f'{len(walls)} stage_wall_time_ns record(s)'
+           + (f'; missing: {", ".join(sorted(missing_w))}' if missing_w else '')
+           + (f'; unexpected: {", ".join(map(str, extra_w))}' if extra_w else ''))
 
   # --- 11.4 load stability across the cell -------------------------------
   loads = [r['load'][0] for r in records if isinstance(r.get('load'), list) and r['load']]
@@ -379,34 +377,28 @@ def check(path, expected_n=10):
   # This is the check that catches the regression class directly. The
   # decryption split vanished once before, when the Pass A module it lived in
   # stopped being called, and nothing noticed until an adviser asked.
-  # Encryption is not in this list: its split is per-ballot and is checked
-  # ballot by ballot below, not in aggregate.
-  for parent, part, derived, unit in (
-      ('decryption_factor_time_ns', 'decryption_factor_only_ns',
-       'decryption_proof_ns', 'ns'),):
-    pv = [r['value'] for r in records if r['metric'] == parent]
-    sv = [r['value'] for r in records if r['metric'] == part]
-    dv = [r['value'] for r in records if r['metric'] == derived]
-    if not pv:
-      continue
-    if not (sv and dv):
-      c.fail(f'{derived} present',
-             f'{parent} is measured but its proof split is missing — '
-             f'processing and ZKP time cannot be separated')
-      continue
+  # Encryption is not here: its split is per-ballot and is checked ballot by
+  # ballot below, not in aggregate.
+  #
+  # decryption_proof_ns is not emitted. It is computed here as the factor loop
+  # minus the factors alone, so a missing part fails the check.
+  pv = [r['value'] for r in records if r['metric'] == 'decryption_factor_time_ns']
+  sv = [r['value'] for r in records if r['metric'] == 'decryption_factor_only_ns']
+  if pv and not sv:
+    c.fail('decryption_proof_ns computable',
+           'decryption_factor_time_ns is measured but decryption_factor_only_ns '
+           'is missing — processing and ZKP time cannot be separated')
+  elif pv:
+    dv = [p - s for p, s in zip(pv, sv)]
     bad = [x for x in dv if x <= 0]
-    over = [x for x, p in zip(sv, pv) if x > p]
     if bad:
-      c.fail(f'{derived} positive',
+      c.fail('decryption_proof_ns positive',
              f'{len(bad)} non-positive — factors alone were not faster than '
              f'factors plus proofs, so the split is noise, not signal')
-    elif over:
-      c.fail(f'{part} < {parent}',
-             f'{len(over)} samples where factors alone exceeded the loop '
-             f'containing them')
     else:
-      share = 100 * sum(dv) / max(sum(pv), 1)
-      c.ok(f'{derived} split valid', f'ZKP is {share:.0f}% of {parent}')
+      share = 100 * sum(dv) / sum(pv[:len(dv)])
+      c.ok('decryption_proof_ns split valid',
+           f'ZKP is {share:.0f}% of decryption_factor_time_ns')
 
   # --- encryption proof time is real, on every ballot ---------------------
   # encryption_proof_ms comes from a decorator on the booth's own
@@ -504,15 +496,15 @@ def check(path, expected_n=10):
            f'{100 * (pt - po) / pt:.1f}% deserialization and row iteration')
 
   # --- payload sizes ------------------------------------------------------
+  # Two from the harness, two from Helios.
   PAYLOADS = {'cast_payload_bytes', 'election_json_bytes',
-              'encrypted_tally_bytes', 'decryption_factors_bytes',
-              'decryption_proofs_bytes'}
+              'decryption_factors_bytes', 'decryption_proofs_bytes'}
   present_payloads = PAYLOADS & {r['metric'] for r in records}
   if present_payloads:
     missing_p = PAYLOADS - present_payloads
     (c.ok if not missing_p else c.fail)(
       'all payload metrics present',
-      f'{len(present_payloads)}/5'
+      f'{len(present_payloads)}/{len(PAYLOADS)}'
       if not missing_p else 'missing: ' + ', '.join(sorted(missing_p)))
 
     # The wire payload must exceed the cryptographic content it wraps: JSON

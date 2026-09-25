@@ -26,25 +26,15 @@ STAGE_OF = {
   'prove_sk_time_ns': 'configure',
   'verification_time_ns': 'encrypt',
   'verification_only_ns': 'encrypt',
-  'election_load_time_ns': 'decrypt',
   'aggregation_time_ns': 'aggregate',
   'aggregation_only_ns': 'aggregate',
-  'task_compute_tally_ns': 'aggregate',
   'decryption_factor_time_ns': 'decrypt',
   'decryption_factor_only_ns': 'decrypt',
   'decryption_factors_bytes': 'decrypt',
   'decryption_proofs_bytes': 'decrypt',
-  'encrypted_tally_bytes': 'aggregate',
-  'task_helios_decrypt_ns': 'decrypt',
   'dlog_precompute_time_ns': 'decrypt',
   'dlog_lookup_time_ns': 'decrypt',
 }
-
-# Timers around a whole Celery task body, as opposed to a single crypto call.
-TASK_METRICS = {'task_compute_tally_ns', 'task_helios_decrypt_ns',
-                # Helios's own persistence and row-load work: task tier, not
-                # cryptography, even though both costs are scheme-determined.
-                'election_load_time_ns'}
 
 # Which Helios process records each metric. Not inferred from pid -- this is a
 # static fact about where Helios does the work, and naming the process is far
@@ -65,19 +55,13 @@ PROCESS_OF = {
   'decryption_factor_only_ns': 'Celery worker',
   'verification_time_ns': 'Celery worker',
   'verification_only_ns': 'Celery worker',
-  'election_load_time_ns': 'Celery worker',
-  'task_compute_tally_ns': 'Celery worker',
-  'task_helios_decrypt_ns': 'Celery worker',
-  'encrypted_tally_bytes': 'Celery worker',
   'decryption_factors_bytes': 'Celery worker',
   'decryption_proofs_bytes': 'Celery worker',
 }
 
 # Payload sizes: what crosses the wire or sits on the board, not a duration.
-# They belong to the flow tier -- they describe the system's output, not the
-# cryptographic operation that produced it.
-PAYLOAD_METRICS = {'decryption_factors_bytes', 'decryption_proofs_bytes',
-                   'encrypted_tally_bytes'}
+# Tagged 'flow', like the harness's own payload metrics.
+PAYLOAD_METRICS = {'decryption_factors_bytes', 'decryption_proofs_bytes'}
 
 # Sidecar metrics the harness reads but does not emit. Empty for now.
 SKIP_EMIT = set()
@@ -89,11 +73,9 @@ REQUIRED_INSTRUMENTED = {
   'keygen_time_ns', 'prove_sk_time_ns', 'aggregation_time_ns',
   'aggregation_only_ns',
   'decryption_factor_time_ns', 'dlog_precompute_time_ns',
-  'dlog_lookup_time_ns', 'task_compute_tally_ns', 'task_helios_decrypt_ns',
+  'dlog_lookup_time_ns',
   'decryption_factor_only_ns', 'verification_only_ns',
-  'election_load_time_ns',
-  'decryption_factors_bytes',
-  'decryption_proofs_bytes', 'encrypted_tally_bytes',
+  'decryption_factors_bytes', 'decryption_proofs_bytes',
 }
 
 
@@ -124,9 +106,7 @@ def read_sidecar(path, election_uuid):
 
 
 def tier_of(metric):
-  if metric in PAYLOAD_METRICS:
-    return 'flow'
-  return 'task' if metric in TASK_METRICS else 'operation'
+  return 'flow' if metric in PAYLOAD_METRICS else 'operation'
 
 
 def extra_for(row):

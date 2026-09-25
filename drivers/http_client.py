@@ -21,7 +21,7 @@ def close_stale_connection():
 
   Django is in autocommit, so every later query sees the worker's committed
   writes without reconnecting. Closing on each poll (50 ms) would add thousands
-  of reconnects inside the measured window.
+  of reconnects during the wait.
   """
   from django.db import connection
   connection.close()

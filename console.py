@@ -1,9 +1,14 @@
 """
-Console output formatting file for workload iterations.\
+Console output formatting file for workload iterations.
+
+Re-print a run's summary from its JSONL:
+    python console.py results/<run_id>.jsonl
 """
 
+import json
 import shutil
 import statistics
+import sys
 import time
 
 WIDTH = min(shutil.get_terminal_size((80, 24)).columns, 78)
@@ -58,13 +63,6 @@ def section(text):
   _p(head + '-' * max(0, WIDTH - len(head)))
 
 
-def subsection(text):
-  """A labelled group inside a section. Lighter than section()."""
-  _p()
-  _p(f'  {text}')
-  _p('  ' + '.' * max(0, WIDTH - 4))
-
-
 def field(key, value, w=18):
   _p(f'  {key:<{w}} {value}')
 
@@ -87,12 +85,6 @@ def warn(msg):
 
 def fail(msg):
   _p(f'  [FAIL] {msg}')
-
-
-def metric(name, value, unit, note=''):
-  """Echo one emitted measurement so the run is legible as it happens."""
-  line = f'     · {name:<32} {value:>14}  {unit}' + (f'   {note}' if note else '')
-  _p(line.rstrip())
 
 
 class Stage:
@@ -192,8 +184,6 @@ def _where(records, metric_name):
         proc = PROCESS_OF.get(metric_name, 'Helios')
       except Exception:
         proc = 'Helios'
-    elif src == 'harness_derived':
-      proc = 'derived'
     elif src:
       proc = 'harness'
     break
@@ -216,159 +206,59 @@ def _median(xs):
   return statistics.median(xs) if xs else None
 
 
-def summary(records, N, stage_walls):
+def _first(records, metric_name):
+  return next((r for r in records if r['metric'] == metric_name), None)
+
+
+def _paired(records, a, b, key):
+  """Per-item a - b, matched on extra[key]. Items missing either are skipped."""
+  def by(metric_name):
+    return {r['extra'][key]: r['value'] for r in records
+            if r['metric'] == metric_name
+            and r.get('extra', {}).get(key) is not None}
+  va, vb = by(a), by(b)
+  return [va[k] - vb[k] for k in va if k in vb]
+
+
+def _n_votes(records, N):
+  """Ballots tallied, from the aggregation record; N if absent."""
+  r = _first(records, 'aggregation_time_ns')
+  return max((r or {}).get('extra', {}).get('n_votes') or N, 1)
+
+
+def _dlog_entries(records, N):
+  r = _first(records, 'dlog_precompute_time_ns')
+  e = (r or {}).get('extra', {})
+  return max(e.get('dlog_entries') or e.get('num_tallied') or N, 1)
+
+
+def _ms(v):
+  return f'{v:.2f} ms' if v < 10 else f'{v:.1f} ms'
+
+
+def _row(label, value, note=''):
+  _p(f'  {label:<26} {value:>10}   {note}'.rstrip())
+
+
+def summary(records, N):
   """Print the measured result of one cell, then project it to larger N."""
-  section('MEASURED — this cell')
+  # Stage walls from their records, in file order.
+  stage_walls = {r['extra']['stage_name']: r['value'] / 1e9 for r in records
+                 if r['metric'] == 'stage_wall_time_ns'}
 
-  # This is the tier the study compares. Everything here changes when the
-  # scheme changes; the tiers below are the system around it.
-  subsection('operation tier — the cryptographic work')
+  # One section per class of metric, and each value is printed once. A timing
+  # that spans several classes (encryption, verify_and_store, the aggregation
+  # and factor loops) is shown as its parts, not as a total.
+  _crypto_ops(records, N)
+  _zkp(records)
+  _payloads(records)
+  _payload_timing(records, N)
 
-  # One measurement each, taken inside Helios at election creation for the key
-  # this election actually used. A distribution comes from repeating cells.
-  for name in ('keygen_time_ns', 'prove_sk_time_ns'):
-    v = _vals(records, name)
-    if v:
-      metric(name, f'{v[0] / 1e6:.2f}', 'ms', _note(records, name))
-
-  # 'browser' per the source taxonomy: a performance.now() reading taken in the
-  # booth page, as opposed to helios_instrumentation or harness_derived.
-  enc_2a = _vals(records, 'encryption_time_ms', source='browser')
-  enc_2b = _vals(records, 'encryption_time_ms', source='node')
-  if enc_2a:
-    metric('encryption_time_ms', f'{_median(enc_2a):.1f}', 'ms/ballot',
-           _note(records, 'encryption_time_ms', f'median of {len(enc_2a)}'))
-  if enc_2b:
-    metric('encryption_time_ms (node)', f'{_median(enc_2b):.1f}', 'ms/ballot',
-           f'n={len(enc_2b)}')
-
-  ct = _vals(records, 'ciphertext_bytes', source='node') or \
-      _vals(records, 'ciphertext_bytes')
-  pf = _vals(records, 'proof_bytes', source='node') or \
-      _vals(records, 'proof_bytes')
-  if ct:
-    metric('ciphertext_bytes', size(_median(ct)), '',
-           _note(records, 'ciphertext_bytes', 'median'))
-  if pf:
-    metric('proof_bytes', size(_median(pf)), '',
-           _note(records, 'proof_bytes', 'median'))
-  ballot_bytes = None
-  if ct and pf:
-    ballot_bytes = _median(ct) + _median(pf)
-    share = 100 * _median(pf) / ballot_bytes
-    metric('ballot total (median)', size(ballot_bytes), '',
-           f'proofs {share:.0f}%')
-
-  agg = _vals(records, 'aggregation_time_ns')
-  agg_per = None
-  n_votes = None
-  for r in records:
-    if r['metric'] == 'aggregation_time_ns':
-      n_votes = r.get('extra', {}).get('n_votes')
-  if agg:
-    agg_per = agg[0] / max(n_votes or N, 1)
-    metric('aggregation_time_ns', f'{agg[0] / 1e6:.1f}', 'ms',
-           _note(records, 'aggregation_time_ns', f'{agg_per / 1e6:.2f} ms/ballot'))
-  # The homomorphic addition on its own. Printed beside its parent because the
-  # gap between the two is row loading and ballot parsing, not cryptography --
-  # which is the distinction the whole comparison rests on.
-  agg_only = _vals(records, 'aggregation_only_ns')
-  if agg and agg_only:
-    metric('aggregation_only_ns', f'{agg_only[0] / 1e6:.1f}', 'ms',
-           _note(records, 'aggregation_only_ns',
-                 f'{100 * agg_only[0] / agg[0]:.0f}% of the loop',
-                 'homomorphic addition alone'))
-
-  fac = _vals(records, 'decryption_factor_time_ns')
-  if fac:
-    metric('decryption_factor_time_ns', f'{fac[0] / 1e6:.1f}', 'ms',
-           _note(records, 'decryption_factor_time_ns'))
-  # Factors without the Chaum-Pedersen proofs, timed on the same pass by a
-  # wrapper on sk.decryption_factor. The remainder is the ZKP table's row.
-  fac_only = _vals(records, 'decryption_factor_only_ns')
-  if fac and fac_only:
-    metric('decryption_factor_only_ns', f'{fac_only[0] / 1e6:.1f}', 'ms',
-           _note(records, 'decryption_factor_only_ns',
-                 f'{100 * fac_only[0] / fac[0]:.0f}% of the loop',
-                 'factors alone'))
-  pre = _vals(records, 'dlog_precompute_time_ns')
-  per_entry = None
-  if pre:
-    entries = None
-    for r in records:
-      if r['metric'] == 'dlog_precompute_time_ns':
-        entries = (r.get('extra', {}).get('dlog_entries')
-                   or r.get('extra', {}).get('num_tallied'))
-    per_entry = pre[0] / max(entries or N, 1)
-    metric('dlog_precompute_time_ns', f'{pre[0] / 1e6:.2f}', 'ms',
-           _note(records, 'dlog_precompute_time_ns',
-                 f'{per_entry / 1e3:.1f} µs/entry', f'{entries} entries'))
-  look = _vals(records, 'dlog_lookup_time_ns')
-  if look:
-    # Directly measured inside decrypt_from_factors, not derived by
-    # subtracting precompute from combine as it was before Option C.
-    metric('dlog_lookup_time_ns', f'{look[0] / 1e6:.2f}', 'ms',
-           _note(records, 'dlog_lookup_time_ns', 'directly measured'))
-
-  v = _vals(records, 'verification_time_ns')
-  if v:
-    metric('verification_time_ns', f'{_median(v) / 1e6:.1f}', 'ms/ballot',
-           _note(records, 'verification_time_ns', f'median of {len(v)}'))
-  v = _vals(records, 'verification_only_ns')
-  if v:
-    metric('verification_only_ns', f'{_median(v) / 1e6:.1f}', 'ms/ballot',
-           _note(records, 'verification_only_ns',
-                 f'median of {len(v)}', 'proof checking alone'))
-
-  for r in records:
-    if r['metric'] == 'result':
-      totals = [sum(q) for q in r['value']] if r['value'] else []
-      metric('tally (per-question totals)', str(totals), '')
-
-  # ---- task tier: Celery task entry to exit ---------------------------------
-  task_rows = [('task_compute_tally_ns', 'aggregate'),
-               ('task_helios_decrypt_ns', 'decrypt')]
-  if any(_vals(records, m) for m, _ in task_rows):
-    subsection('task tier — Celery task entry to exit')
-    for m, phase in task_rows:
-      v = _vals(records, m)
-      if v:
-        metric(m, f'{v[0] / 1e6:.1f}', 'ms', _note(records, m))
-    # Two records per run, one per task; distinguished by the task attribute.
-    # Outside the task span, so it is not part of any nesting check.
-    for r in records:
-      if r['metric'] == 'election_load_time_ns':
-        _task = (r.get('extra') or {}).get('task', '')
-        metric('election_load_time_ns', f'{r["value"] / 1e6:.1f}', 'ms',
-               f'{_task}, outside the task span')
-
-  # ---- flow tier: what the administrator waits for --------------------------
-  flow_rows = [('flow_cast_ns', 'cast'),
-               ('flow_aggregate_ns', 'aggregate'),
-               ('flow_combine_ns', 'decrypt, synchronous')]
-  if any(_vals(records, m) for m, _ in flow_rows):
-    subsection('flow tier — POST to completion observed')
-    for m, phase in flow_rows:
-      v = _vals(records, m)
-      if not v:
-        continue
-      poll = per_ballot = None
-      for r in records:
-        if r['metric'] == m:
-          poll = r.get('extra', {}).get('poll_interval_ms')
-          per_ballot = r.get('extra', {}).get('per_ballot_ns')
-      note = phase
-      if per_ballot:
-        # flow_cast_ns is the only flow phase that scales with N, so the
-        # per-ballot rate is what transfers to a larger electorate.
-        note += f', {per_ballot / 1e6:.0f} ms/ballot'
-      if poll:
-        note += f', +/-{poll:.0f} ms poll'
-      metric(m, f'{v[0] / 1e6:.1f}', 'ms', note)
-
-  _decomposition(records)
-  _zkp_split(records)
-  _payloads(records, N)
+  res = _first(records, 'result')
+  if res:
+    section('RESULT — decrypted tally')
+    totals = [sum(q) for q in res['value']] if res['value'] else []
+    _row('per-question totals', str(totals))
 
   # ---- operational wall clock ----------------------------------------------
   if stage_walls:
@@ -380,107 +270,143 @@ def summary(records, N, stage_walls):
     _p(f'  {"TOTAL":<22} {dur(total):>10}')
 
   # ---- projection -----------------------------------------------------------
-  _projection(N, enc_2a, agg_per, per_entry, ballot_bytes, stage_walls)
+  # Whole-phase rates: a projection asks how long each phase takes.
+  enc = _vals(records, 'encryption_time_ms', source='browser')
+  agg = _vals(records, 'aggregation_time_ns')
+  agg_per = agg[0] / _n_votes(records, N) if agg else None
+  pre = _vals(records, 'dlog_precompute_time_ns')
+  per_entry = pre[0] / _dlog_entries(records, N) if pre else None
+  ct, pf = _vals(records, 'ciphertext_bytes'), _vals(records, 'proof_bytes')
+  ballot_bytes = _median(ct) + _median(pf) if ct and pf else None
+  _projection(N, enc, agg_per, per_entry, ballot_bytes, stage_walls)
 
 
-def _decomposition(records):
+def _crypto_ops(records, N):
   """
-  The aggregate phase split across all three tiers.
-
-  This is the quantity that makes the study system-level rather than a
-  benchmark: it shows how much of an administrator's wait is the cryptosystem
-  and how much is the system around it.
+  The cryptographic work alone. Proofs are in the ZKP section, and the
+  parsing around the work is in payload-driven timing.
   """
-  def one(metric_name):
-    v = [r['value'] for r in records if r['metric'] == metric_name]
-    return v[0] if v else None
+  rows = []
 
-  flow = one('flow_aggregate_ns')
-  task = one('task_compute_tally_ns')
-  op = one('aggregation_time_ns')
-  if not (flow and task and op):
+  # Once per election, for the key this election actually used.
+  kg = _vals(records, 'keygen_time_ns')
+  if kg:
+    rows.append(('keygen_time_ns', _ms(kg[0] / 1e6),
+                 _note(records, 'keygen_time_ns')))
+
+  # Encryption minus proof generation, paired per ballot.
+  enc = _paired(records, 'encryption_time_ms', 'encryption_proof_ms', 'sample')
+  if enc:
+    rows.append(('encryption, excl. proof', _ms(_median(enc)),
+                 _note(records, 'encryption_time_ms', 'derived',
+                       f'median of {len(enc)}')))
+
+  # Homomorphic addition alone, inside the aggregation loop.
+  agg_only = _vals(records, 'aggregation_only_ns')
+  if agg_only:
+    per = agg_only[0] / _n_votes(records, N)
+    rows.append(('aggregation_only_ns', _ms(agg_only[0] / 1e6),
+                 _note(records, 'aggregation_only_ns',
+                       f'{per / 1e6:.2f} ms/ballot')))
+
+  # Factors alone, inside the factor-and-proof loop.
+  fac_only = _vals(records, 'decryption_factor_only_ns')
+  if fac_only:
+    rows.append(('decryption_factor_only_ns', _ms(fac_only[0] / 1e6),
+                 _note(records, 'decryption_factor_only_ns')))
+
+  pre = _vals(records, 'dlog_precompute_time_ns')
+  if pre:
+    entries = _dlog_entries(records, N)
+    rows.append(('dlog_precompute_time_ns', _ms(pre[0] / 1e6),
+                 _note(records, 'dlog_precompute_time_ns',
+                       f'{pre[0] / entries / 1e3:.1f} µs/entry',
+                       f'{entries} entries')))
+
+  look = _vals(records, 'dlog_lookup_time_ns')
+  if look:
+    rows.append(('dlog_lookup_time_ns', _ms(look[0] / 1e6),
+                 _note(records, 'dlog_lookup_time_ns')))
+
+  # Paillier's decryption, which has no dlog step.
+  dec = _vals(records, 'decryption_time_ns')
+  if dec:
+    rows.append(('decryption_time_ns', _ms(dec[0] / 1e6),
+                 _note(records, 'decryption_time_ns')))
+
+  if not rows:
     return
-
-  section('DECOMPOSITION — aggregate phase')
-  # A containing span cannot be shorter than what it contains. If that holds
-  # here the run is mismeasured, and printing a negative remainder or a >100%
-  # share would present the error as a result. Acceptance fails on this too.
-  if not (flow >= task >= op):
-    warn(f'ordering violated: flow {flow / 1e6:.1f} / task {task / 1e6:.1f} / '
-         f'operation {op / 1e6:.1f} ms — a span is shorter than what it '
-         f'contains, so this cell is mismeasured')
-    return
-  _p(f'  {"flow":<38} {flow / 1e6:>9.1f} ms   POST to observed completion')
-  _p(f'  {"  task":<38} {task / 1e6:>9.1f} ms   Celery entry to exit')
-  _p(f'  {"    operation":<38} {op / 1e6:>9.1f} ms   the cryptosystem')
-  _p('  ' + '-' * (WIDTH - 4))
-  _p(f'  {"flow - task  (HTTP, queue, poll)":<38} '
-     f'{(flow - task) / 1e6:>9.1f} ms')
-  _p(f'  {"task - operation  (ORM, persistence)":<38} '
-     f'{(task - op) / 1e6:>9.1f} ms')
-  _p(f'  {"cryptosystem share of the phase":<38} '
-     f'{100 * op / flow:>9.1f} %')
+  section('CRYPTOGRAPHIC OPERATIONS — crypto only, proofs excluded')
+  for label, value, note in rows:
+    _row(label, value, note)
 
 
-def _zkp_split(records):
+def _zkp(records):
   """
-  Where proof work happens, separated from the processing it accompanies.
+  Proof generation and checking, separated from the operations they sit in.
 
-  Zero-knowledge proofs are the dominant cost in a verifiable election, and
-  they are paid in three different places by two different parties. Reporting
-  one blended number per stage would hide that.
-
-  Every column is a metric that was timed directly -- the booth's decorator on
-  generateDisjunctiveProof, and Helios's own spans. The operation column is the
-  call that CONTAINS the proof work (encryption, verify_and_store, the
-  factor-and-proof loop), so the share is proof time over the operation it is
-  part of, which is the quantity the operation-tier reference quotes.
-
-  The remainders are deliberately not shown. Reading them off the two columns
-  is a subtraction; storing them was a metric with nothing in it.
+  The share is proof time over the call that contains it. That total is not
+  printed: its other part is in its own section.
   """
   def med(metric, **want):
     v = [r['value'] for r in records if r['metric'] == metric
          and all(r.get('extra', {}).get(k) == w for k, w in want.items())]
     return _median(v) if v else None
 
-  enc_total = med('encryption_time_ms', source='browser')
+  def share(part, whole, what):
+    return f'{100 * part / whole:.0f}% of {what}' if part and whole else ''
+
+  rows = []
+
+  # keygen and prove_sk are adjacent spans with no span around the pair, so
+  # key setup is their sum.
+  sk = med('prove_sk_time_ns')
+  if sk is not None:
+    kg = med('keygen_time_ns')
+    rows.append(('prove_sk_time_ns', _ms(sk / 1e6),
+                 _note(records, 'prove_sk_time_ns',
+                       share(sk, kg and kg + sk, 'key setup'))))
+
   enc_proof = med('encryption_proof_ms', source='browser')
-  ver_total, ver_only = med('verification_time_ns'), med('verification_only_ns')
-  dec_total = med('decryption_factor_time_ns')
-  dec_proof = med('decryption_proof_ns')
-  if not any((enc_proof, ver_only, dec_proof)):
-    return
-
-  section('ZKP — proof work as a share of the operation containing it')
-  _p(f'  {"where":<26} {"operation":>12} {"ZKP":>12} {"ZKP share":>11}')
-  _p('  ' + '-' * (WIDTH - 4))
-
-  def row(where, total_ms, zkp_ms, note=''):
-    share = f'{100 * zkp_ms / total_ms:.0f}%' if (zkp_ms and total_ms) else '—'
-    _p(f'  {where:<26} {(f"{total_ms:.1f} ms" if total_ms else "—"):>12} '
-       f'{(f"{zkp_ms:.1f} ms" if zkp_ms else "—"):>12} {share:>11}'
-       + (f'   {note}' if note else ''))
-
-  def ms(ns_value):
-    return ns_value / 1e6 if ns_value else None
-
   if enc_proof is not None:
-    row("voter's browser", enc_total, enc_proof, 'per ballot')
+    n = len(_vals(records, 'encryption_proof_ms', source='browser'))
+    rows.append(('encryption_proof_ms', _ms(enc_proof),
+                 _note(records, 'encryption_proof_ms', f'median of {n}',
+                       share(enc_proof,
+                             med('encryption_time_ms', source='browser'),
+                             'encryption'))))
+
+  ver_only = med('verification_only_ns')
   if ver_only is not None:
-    # Measured, not asserted: verification_only_ns isolates proof checking
-    # inside the verify_and_store that contains it.
-    row('server, at cast', ms(ver_total), ms(ver_only), 'per ballot')
-  if dec_proof is not None:
-    row('server, at decrypt', ms(dec_total), ms(dec_proof), 'once')
+    n = len(_vals(records, 'verification_only_ns'))
+    rows.append(('verification_only_ns', _ms(ver_only / 1e6),
+                 _note(records, 'verification_only_ns', f'median of {n}',
+                       share(ver_only, med('verification_time_ns'),
+                             'verify_and_store'))))
+
+  # Not emitted: the factor loop minus the factors alone, one of each per cell.
+  ft = _first(records, 'decryption_factor_time_ns')
+  fo = _first(records, 'decryption_factor_only_ns')
+  if ft and fo:
+    dec_proof = ft['value'] - fo['value']
+    rows.append(('decryption_proof_ns', _ms(dec_proof / 1e6),
+                 _note(records, 'decryption_factor_time_ns', 'derived',
+                       share(dec_proof, ft['value'], 'the factor loop'))))
+
+  if not rows:
+    return
+  section('ZKP PROCESSING — proof generation and checking')
+  for label, value, note in rows:
+    _row(label, value, note)
 
 
-def _payloads(records, N):
-  """What crosses the wire and what ends up on the board."""
+def _payloads(records):
+  """Payload sizes: what the scheme produces, on the wire and in storage."""
   WHAT = [
+    ('ciphertext_bytes',         'per ballot, median'),
+    ('proof_bytes',              'per ballot, median'),
     ('cast_payload_bytes',       'voter -> server, per ballot'),
     ('election_json_bytes',      'server -> voter, once per session'),
-    ('encrypted_tally_bytes',    'on the board, after tally'),
     ('decryption_factors_bytes', 'trustee -> board'),
     ('decryption_proofs_bytes',  'trustee -> board'),
   ]
@@ -492,25 +418,48 @@ def _payloads(records, N):
   if not vals:
     return
 
-  section('PAYLOADS — bytes, not just time')
+  section('PAYLOAD SIZES — on the wire and in storage')
   for m, what in WHAT:
     if m in vals:
-      _p(f'  {m:<26} {size(vals[m]):>10}   {what}')
+      _row(m, size(vals[m]), what)
+    # The ballot's crypto content, right after its two parts.
+    if m == 'proof_bytes' and {'ciphertext_bytes', 'proof_bytes'} <= set(vals):
+      ballot = vals['ciphertext_bytes'] + vals['proof_bytes']
+      pct = 100 * vals['proof_bytes'] / ballot
+      _row('ballot total', size(ballot),
+           f'ciphertext + proof, proofs {pct:.0f}%')
 
-  # Board total. Only the cast payload multiplies by N; the rest are per
-  # election, which is the point of measuring them separately.
-  cast = vals.get('cast_payload_bytes')
-  if cast:
-    fixed = sum(vals.get(m, 0) for m in
-                ('encrypted_tally_bytes', 'decryption_factors_bytes',
-                 'decryption_proofs_bytes'))
-    total = cast * N + fixed
-    _p('  ' + '-' * (WIDTH - 4))
-    _p(f'  {"board total at N=" + str(N):<26} {size(total):>10}   '
-       f'cast x {N} + tally + factors + proofs')
-    if fixed:
-      _p(f'  {"":<26} {"":>10}   the fixed part is '
-         f'{100 * fixed / total:.1f}% here, and does not grow with N')
+def _payload_timing(records, N):
+  """
+  Server time that grows with payload size, not with the crypto. Scales with
+  the ballot total in PAYLOAD SIZES.
+
+  Derived here from records already emitted; nothing new is recorded.
+  """
+  rows = []
+
+  # Parse: the aggregation loop minus the homomorphic addition inside it.
+  agg, agg_only = (_first(records, 'aggregation_time_ns'),
+                   _first(records, 'aggregation_only_ns'))
+  if agg and agg_only:
+    per = (agg['value'] - agg_only['value']) / _n_votes(records, N)
+    rows.append(('parse, per ballot', _ms(per / 1e6),
+                 'reading a ballot from storage'))
+
+  # Persistence: verify_and_store minus the proof checking inside it, paired
+  # on the same ballot. What remains is the two row writes.
+  diffs = _paired(records, 'verification_time_ns', 'verification_only_ns',
+                  'cast_vote_id')
+  if diffs:
+    rows.append(('persistence, per ballot', _ms(_median(diffs) / 1e6),
+                 f'writing a ballot to storage (x2), median of '
+                 f'{len(diffs)} pairs'))
+
+  if not rows:
+    return
+  section('PAYLOAD-DRIVEN TIMING — derived, not emitted')
+  for label, value, note in rows:
+    _row(label, value, note)
 
 
 def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
@@ -565,3 +514,13 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
     gb = (100 << 30) / ballot_bytes
     detail(f'At {size(ballot_bytes)}/ballot, 100 GiB of board holds '
            f'~{int(gb):,} ballots.')
+
+
+if __name__ == '__main__':
+  path = sys.argv[1]
+  with open(path) as f:
+    records = [json.loads(line) for line in f if line.strip()]
+  r0 = records[0]
+  N = r0['N']
+  _p(f'{path} — scheme {r0["scheme"]}, N={N}, rep {r0["rep"]}')
+  summary(records, N)

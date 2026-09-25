@@ -41,9 +41,8 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
 
   n_answers = sum(len(q['answers']) for q in questions) # Sum of possible choices
 
-  # Store records/walls
+  # Store records
   records = []
-  walls = {}
 
   # Record produced by emit in .json file
   def em(stage, metric, value, unit, extra=None):
@@ -51,6 +50,11 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
                      metric=metric, value=value, unit=unit, extra=extra)
     records.append(r)
     return r
+
+  # One stage wall clock. The console's WALL CLOCK table is built from these.
+  def stage_wall(stage, name, seconds):
+    em(stage, 'stage_wall_time_ns', int(seconds * 1e9), 'ns',
+       {'stage_name': name, 'operational': True})
 
   # Header formatted
   console.title('HELIOS WORKLOAD — cell execution')
@@ -81,14 +85,10 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       questions=questions, n_voters=N, log=log)
   
   # time_perf_counter_ns ends at with... as... statement
-  # stored in walls array
-  walls['stage 0 configure'] = stg_zero.wall
-  # first and second records in jsonl file
+  stage_wall('configure', 'stage 0 configure', stg_zero.wall)
   em('configure', 'election_created', 1, 'count',
      {'election_uuid': election_uuid, 'short_name': short_name,
       'n_questions': len(questions), 'n_answers': n_answers})
-  em('configure', 'stage_wall_time_ns', int(stg_zero.wall * 1e9), 'ns',
-     {'stage_name': 'configure', 'operational': True})
 
   # Stage 1 - freeze election
   from drivers import stage1_freeze
@@ -104,7 +104,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     console.step('freezing election (locks ballot + roll, opens voting)')
     t0 = time.perf_counter()
     stage1_freeze.freeze(base_url=base_url, election_uuid=election_uuid, log=log)
-    walls['stage 1 freeze'] = time.perf_counter() - t0
+    stage_wall('freeze', 'stage 1 freeze', time.perf_counter() - t0)
 
     # What every voter's browser downloads before it can render a ballot. The
     # endpoint already exists (views.one_election), so this needs no Helios
@@ -142,7 +142,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       base_url=base_url, election_uuid=election_uuid, ballots=ballots,
       out_path=out_path, headless=headless,
       warmup=enc_cfg.get('warmup_ballots', 1), log=log)
-    walls['stage 2 encrypt'] = time.perf_counter() - t0
+    stage_wall('encrypt', 'stage 2 encrypt', time.perf_counter() - t0)
 
     # Discarded warm-up ballots: kept in the record, excluded from analysis.
     for i, t in enumerate(warmup_timings):
@@ -169,34 +169,22 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       # record held nothing the first two did not, once per ballot. The ZKP
       # table reports proof time against the encryption containing it instead.
 
-    # One liveness line; the values themselves are reported under MEASURED.
+    # One liveness line; the values themselves are in the summary.
     timings = [s['timing_ms'] for s in samples]
     mean_ms = sum(timings) / max(len(timings), 1)
     console.detail(f'{len(samples)} ballots encrypted, '
-                   f'mean {mean_ms:.0f} ms — see MEASURED below')
+                   f'mean {mean_ms:.0f} ms — see summary below')
 
     console.step('retrieving voter credentials')
     credentials = voters_gen.fetch_credentials(election_uuid)
 
     console.step(f'casting {N} ballots through the real HTTP flow')
-    # perf_counter_ns, matching the other flow metrics; walls is derived from
-    # it so there is one clock read, not two.
-    t0 = time.perf_counter_ns()
+    t0 = time.perf_counter()
     n_cast, payloads = stage2_encryption.cast_ballots(
       base_url=base_url, election_uuid=election_uuid,
       encrypted=stage2_encryption.load_encrypted(out_path),
       credentials=credentials, total=N, log=log)
-    cast_ns = time.perf_counter_ns() - t0
-    walls['stage 2 cast'] = cast_ns / 1e9
-
-    # The cast phase, voter -> server, N times: login, POST /cast, POST
-    # /cast_confirm per voter. Previously this was measured into walls only,
-    # which is operational bookkeeping and excluded from analysis -- so the one
-    # phase the voter actually experiences was absent from the flow tier.
-    em('encrypt', 'flow_cast_ns', cast_ns, 'ns',
-       {'tier': 'flow', 'n_ballots': n_cast,
-        'per_ballot_ns': int(cast_ns / max(n_cast, 1)),
-        'note': 'login + POST /cast + POST /cast_confirm, per voter'})
+    stage_wall('encrypt', 'stage 2 cast', time.perf_counter() - t0)
 
     # What crossed the wire, as opposed to ciphertext_bytes + proof_bytes which
     # count cryptographic content only.
@@ -209,10 +197,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
                     'Stage 3 cannot start until this drains')
     t0 = time.perf_counter()
     stage2_encryption.await_verification(election_uuid, n_cast, log=log)
-    walls['stage 2 verify'] = time.perf_counter() - t0
-
-  em('encrypt', 'stage_wall_time_ns', int(st.wall * 1e9), 'ns',
-      {'stage_name': 'encrypt_and_cast', 'operational': True, 'n_ballots': n_cast})
+    stage_wall('encrypt', 'stage 2 verify', time.perf_counter() - t0)
 
   # ---- STAGES 3+4 · THE REAL FLOW, INSTRUMENTED -----------------------------
   # There is exactly ONE execution. Each stage drives its own phase through the
@@ -235,11 +220,11 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   with console.Stage('STAGE 3 · HOMOMORPHIC AGGREGATION (via endpoint)') as st3:
     console.step('POST /compute_tally, then wait for encrypted_tally')
     console.detail('aggregation runs in the Celery worker and is timed from '
-                   'inside Helios; this measures the phase around it')
+                   'inside Helios')
     f3 = stage3_aggregate.compute_tally(
       base_url=base_url, election_uuid=election_uuid,
       poll_s=poll_s, timeout_s=timeout_s, log=log)
-  walls['stage 3 aggregate'] = st3.wall
+  stage_wall('aggregate', 'stage 3 aggregate', st3.wall)
 
   with console.Stage('STAGE 4 · DECRYPTION (via endpoints)') as st4:
     console.step('waiting for decryption_factors')
@@ -249,17 +234,12 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       election_uuid=election_uuid, since_ns=f3['signal_ns'],
       poll_s=poll_s, timeout_s=timeout_s, log=log)
 
-    console.step('POST /combine_decryptions — synchronous, exact')
-    combine_ns, flow_result = stage4_decrypt.combine(
+    console.step('POST /combine_decryptions — synchronous')
+    result = stage4_decrypt.combine(
       base_url=base_url, election_uuid=election_uuid, log=log)
-  walls['stage 4 decrypt'] = st4.wall
+  stage_wall('decrypt', 'stage 4 decrypt', st4.wall)
 
-  em('aggregate', 'flow_aggregate_ns', f3['flow_aggregate_ns'], 'ns',
-     {'tier': 'flow', 'poll_interval_ms': f3['poll_interval_ms'],
-      'n_votes': n_cast})
-  em('decrypt', 'flow_combine_ns', combine_ns, 'ns',
-     {'tier': 'flow', 'synchronous': True})
-  em('decrypt', 'result', flow_result, 'tally', {'election_uuid': election_uuid})
+  em('decrypt', 'result', result, 'tally', {'election_uuid': election_uuid})
 
   # ---- join Helios's own timings --------------------------------------------
   console.section('INSTRUMENTATION · joined from Helios sidecar')
@@ -280,9 +260,8 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       for r in metric_rows:
         em(measure_join.STAGE_OF.get(metric, 'decrypt'), metric, r['value'],
            r.get('unit', 'ns'), measure_join.extra_for(r))
-      # No value echo here: every metric in this block reappears in a labelled
-      # section below (MEASURED, ZKP, PAYLOADS). Printing it twice made the
-      # section redundant as a list of values.
+      # No value echo here: the summary prints each metric in its section
+      # (crypto, ZKP, payload sizes, payload-driven timing).
 
     # The one thing this section uniquely establishes: records arrived from
     # more than one process, so the work really ran where Helios runs it.
@@ -298,18 +277,8 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
                    'absent, Django was started without HELIOS_MEASURE_PATH '
                    'and must be restarted, not just re-exported.')
 
-    # ZKP split, decryption side. decryption_factor_only_ns is timed on the
-    # real pass (a wrapper on sk.decryption_factor), so the remainder is
-    # Chaum-Pedersen proof generation.
-    def _first(metric):
-      v = rows.get(metric)
-      return v[0]['value'] if v else None
-
-    ft, fo = _first('decryption_factor_time_ns'), _first('decryption_factor_only_ns')
-    if ft is not None and fo is not None:
-      em('decrypt', 'decryption_proof_ns', max(ft - fo, 0), 'ns',
-         {'tier': 'operation', 'source': 'harness_derived', 'derived': True,
-          'note': 'decryption_factor_time_ns minus decryption_factor_only_ns'})
+    # Decryption proof time is not emitted: console and acceptance compute it
+    # as decryption_factor_time_ns minus decryption_factor_only_ns.
 
     # Verification split. verification_time_ns encloses verify_and_store, which
     # is proof checking PLUS two row writes; verification_only_ns isolates the
@@ -319,7 +288,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     # table reports proof checking against verification_time_ns instead.
 
   # Summary of results
-  console.summary(records, N, walls)
+  console.summary(records, N)
 
   console.section('OUTPUT')
   console.field('measurements', emitter.path)
@@ -328,7 +297,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   console.field('verify with',
                 f'python acceptance.py {emitter.path} {N}')
 
-  return {'election_uuid': election_uuid, 'result': flow_result,
+  return {'election_uuid': election_uuid, 'result': result,
           'jsonl': str(emitter.path), 'records': len(records)}
 
 def main(argv=None):
