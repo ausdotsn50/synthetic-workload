@@ -24,6 +24,11 @@ import schemes
 REQUIRED_STAGES = {'configure', 'freeze', 'encrypt',
                    'aggregate', 'decrypt'}
 
+# stage_name of each stage_wall_time_ns record runner.py emits.
+STAGE_WALLS = {'stage 0 configure', 'stage 1 freeze', 'stage 2 encrypt',
+               'stage 2 cast', 'stage 2 verify', 'stage 3 aggregate',
+               'stage 4 decrypt'}
+
 # Required metrics are SCHEME-DEPENDENT (build spec §8.3). The dlog metrics
 # belong to ElGamal alone; requiring them of a Paillier run would fail a correct
 # run, which is how a guard turns into an obstacle. See schemes.required_metrics.
@@ -261,6 +266,265 @@ def check(path, expected_n=10):
     else 'present but impossible under this scheme: '
          + ', '.join(sorted(forbidden)))
 
+  # === Option C: instrumented-in-place checks ==============================
+  def _ex(r):
+    return r.get('extra', {})
+
+  def _by(metric, **want):
+    return [r for r in records if r['metric'] == metric
+            and all(_ex(r).get(k) == v for k, v in want.items())]
+
+  instrumented = [r for r in records
+                  if _ex(r).get('source') == 'helios_instrumentation']
+
+  # --- 8.1 instrumentation present ---------------------------------------
+  # Catches HELIOS_MEASURE_PATH unset on the worker, the measure/instrumentation
+  # branch not checked out, or a span dropped in a merge.
+  # Imported, not duplicated: a local copy drifted once already, leaving
+  # acceptance checking a weaker set than the join required. measure_join is
+  # the single source of truth for what Helios emits, and it imports only json
+  # and os, so acceptance still runs without Django.
+  from drivers.measure_join import REQUIRED_INSTRUMENTED
+  if not instrumented:
+    c.fail('Helios instrumentation present',
+           'no records with source=helios_instrumentation — the sidecar was '
+           'empty or unreadable. Check HELIOS_MEASURE_PATH on BOTH the Django '
+           'process and the Celery worker.')
+  else:
+    required_i = REQUIRED_INSTRUMENTED - schemes.forbidden_metrics(scheme)
+    missing_i = required_i - {r['metric'] for r in instrumented}
+    (c.ok if not missing_i else c.fail)(
+      f'all instrumented metrics present (for {scheme})',
+      f'{len(instrumented)} records from Helios'
+      if not missing_i else 'missing: ' + ', '.join(sorted(missing_i)))
+
+    # --- 8.7 exactly one tally per election ------------------------------
+    aggs = _by('aggregation_time_ns', source='helios_instrumentation')
+    (c.ok if len(aggs) == 1 else c.fail)(
+      'exactly one tally for this election',
+      f'{len(aggs)} aggregation_time_ns record(s)'
+      + ('' if len(aggs) == 1 else ' — the cell tallied more than once, so '
+                                   'every number in it is suspect'))
+
+    # --- 8.4 process separation ------------------------------------------
+    # Aggregation runs in the Celery worker, the dlog work in the web process.
+    # Equal pids mean the flow was not actually exercised across processes.
+    web = _by('dlog_lookup_time_ns', source='helios_instrumentation')
+    if aggs and web:
+      pa, pc = _ex(aggs[0]).get('pid'), _ex(web[0]).get('pid')
+      if pa is None or pc is None:
+        c.warn('worker and web process are distinct', 'pid missing on a record')
+      elif pa != pc:
+        c.ok('worker and web process are distinct',
+             f'aggregation pid {pa}, dlog pid {pc}')
+      else:
+        c.fail('worker and web process are distinct',
+               f'both pid {pa} — either Celery ran eagerly in-process (a test '
+               f'configuration, not a real run) or the flow was bypassed')
+
+  # --- 8.8 tier and source completeness ----------------------------------
+  untagged = sorted({
+    r['metric'] for r in records
+    if r['unit'] in ('ns', 'ms')
+    and not _ex(r).get('tier') and not _ex(r).get('operational')})
+  (c.ok if not untagged else c.fail)(
+    'every timing carries tier or operational',
+    '' if not untagged else 'untagged: ' + ', '.join(untagged))
+
+  no_source = sorted({
+    r['metric'] for r in records
+    if _ex(r).get('tier') == 'operation' and not _ex(r).get('source')})
+  (c.ok if not no_source else c.fail)(
+    'every operation metric declares a source',
+    '' if not no_source else 'no source: ' + ', '.join(no_source))
+
+  # Measurements only: anything derivable is computed at print time.
+  derived = sorted({
+    r['metric'] for r in records
+    if _ex(r).get('derived') is True
+    or _ex(r).get('source') == 'harness_derived'})
+  (c.ok if not derived else c.fail)(
+    'no derived records emitted',
+    '' if not derived else 'derived: ' + ', '.join(derived))
+
+  # The console re-prints WALL CLOCK and the projection from these alone.
+  walls = [_ex(r).get('stage_name') for r in records
+           if r['metric'] == 'stage_wall_time_ns']
+  missing_w = STAGE_WALLS - set(walls)
+  extra_w = sorted(set(walls) - STAGE_WALLS, key=str)
+  name_w = f'all {len(STAGE_WALLS)} stage walls present'
+  if not missing_w and not extra_w and len(walls) == len(STAGE_WALLS):
+    c.ok(name_w, f'{len(walls)} stage_wall_time_ns records')
+  else:
+    c.fail(name_w,
+           f'{len(walls)} stage_wall_time_ns record(s)'
+           + (f'; missing: {", ".join(sorted(missing_w))}' if missing_w else '')
+           + (f'; unexpected: {", ".join(map(str, extra_w))}' if extra_w else ''))
+
+  # --- 11.4 load stability across the cell -------------------------------
+  loads = [r['load'][0] for r in records if isinstance(r.get('load'), list) and r['load']]
+  if loads:
+    first, peak = loads[0], max(loads)
+    if peak > 1.5 * max(first, 0.1):
+      c.warn('load stable across the cell',
+             f'1-min load rose from {first:.2f} to {peak:.2f} '
+             f'({peak / max(first, 0.01):.1f}x) — encryption timings are '
+             f'sensitive to this even when operation metrics are not')
+    else:
+      c.ok('load stable across the cell', f'{first:.2f} -> {peak:.2f}')
+
+  # --- ZKP splits: positive and bounded by their parent -------------------
+  # This is the check that catches the regression class directly. The
+  # decryption split vanished once before, when the Pass A module it lived in
+  # stopped being called, and nothing noticed until an adviser asked.
+  # Encryption is not here: its split is per-ballot and is checked ballot by
+  # ballot below, not in aggregate.
+  #
+  # decryption_proof_ns is not emitted. It is computed here as the factor loop
+  # minus the factors alone, so a missing part fails the check.
+  pv = [r['value'] for r in records if r['metric'] == 'decryption_factor_time_ns']
+  sv = [r['value'] for r in records if r['metric'] == 'decryption_factor_only_ns']
+  if pv and not sv:
+    c.fail('decryption_proof_ns computable',
+           'decryption_factor_time_ns is measured but decryption_factor_only_ns '
+           'is missing — processing and ZKP time cannot be separated')
+  elif pv:
+    dv = [p - s for p, s in zip(pv, sv)]
+    bad = [x for x in dv if x <= 0]
+    if bad:
+      c.fail('decryption_proof_ns positive',
+             f'{len(bad)} non-positive — factors alone were not faster than '
+             f'factors plus proofs, so the split is noise, not signal')
+    else:
+      share = 100 * sum(dv) / sum(pv[:len(dv)])
+      c.ok('decryption_proof_ns split valid',
+           f'ZKP is {share:.0f}% of decryption_factor_time_ns')
+
+  # --- encryption proof time is real, on every ballot ---------------------
+  # encryption_proof_ms comes from a decorator on the booth's own
+  # generateDisjunctiveProof. The failure mode that matters is not a wrong
+  # number, it is a decorator that never fired: that reports 0.0, and every
+  # share computed from it becomes a claim about work nobody timed. So this
+  # fails, per ballot, rather than warning in aggregate.
+  #
+  # Bounded above by encryption_time_ms for the same reason the decryption
+  # split is: proof generation happens inside the encryption it is part of, so
+  # a proof time that equals or exceeds the whole is a measurement error.
+  def _by_sample(metric_name, **want):
+    out = {}
+    for r in records:
+      if r['metric'] != metric_name:
+        continue
+      e = r.get('extra', {}) or {}
+      if any(e.get(k) != v for k, v in want.items()):
+        continue
+      out[e.get('sample')] = r['value']
+    return out
+
+  enc_total = _by_sample('encryption_time_ms', source='browser')
+  enc_proof = _by_sample('encryption_proof_ms', source='browser')
+  if enc_total and not enc_proof:
+    c.fail('encryption_proof_ms present',
+           'encryption is measured but its proof time is missing — the ZKP '
+           'probe did not run, and the browser side of the ZKP split is gone')
+  elif enc_proof:
+    paired = [(i, enc_proof[i], enc_total[i]) for i in enc_proof
+              if i in enc_total]
+    orphan = [i for i in enc_proof if i not in enc_total]
+    zero = [i for i, p, _t in paired if p <= 0]
+    over = [i for i, p, t in paired if p >= t]
+    if orphan:
+      c.fail('every encryption_proof_ms pairs with a ballot',
+             f'{len(orphan)} sample(s) have proof time but no '
+             f'encryption_time_ms to bound it')
+    elif zero:
+      c.fail('encryption_proof_ms > 0 on every ballot',
+             f'{len(zero)}/{len(paired)} ballot(s) report zero proof time — '
+             f'the probe was installed but never fired, so this metric is '
+             f'fabricated, not measured')
+    elif over:
+      c.fail('encryption_proof_ms < encryption_time_ms on every ballot',
+             f'{len(over)}/{len(paired)} ballot(s) spent at least their whole '
+             f'encryption inside proof generation, which is impossible — the '
+             f'accumulator is not being zeroed per ballot')
+    else:
+      share = 100 * sum(p for _i, p, _t in paired) / sum(
+        t for _i, _p, t in paired)
+      c.ok('encryption proof split valid on every ballot',
+           f'ZKP is {share:.0f}% of encryption_time_ms across '
+           f'{len(paired)} ballot(s)')
+
+  # --- verification split is sane -----------------------------------------
+  # The ZKP table reports verification as essentially all proof checking. That
+  # is now measured: if it drops below 90%, something other than verification
+  # has become expensive and the table's framing needs revisiting.
+  vt = [r['value'] for r in records if r['metric'] == 'verification_time_ns']
+  vo = [r['value'] for r in records if r['metric'] == 'verification_only_ns']
+  if vt and vo:
+    import statistics as _st
+    mt, mo = _st.median(vt), _st.median(vo)
+    if not 0 < mo <= mt:
+      c.fail('verification_only_ns within verification_time_ns',
+             f'{mo / 1e6:.1f} ms vs {mt / 1e6:.1f} ms — the isolated span is '
+             f'not inside the span containing it')
+    elif mo / mt <= 0.90:
+      c.warn('verification is essentially all proof checking',
+             f'proof checking is {100 * mo / mt:.1f}% of verify_and_store — '
+             f'below 90%, so the row writes are no longer negligible')
+    else:
+      c.ok('verification is essentially all proof checking',
+           f'{100 * mo / mt:.1f}% is proof checking, '
+           f'{100 * (mt - mo) / mt:.1f}% row writes')
+
+  # --- aggregation split is sane ------------------------------------------
+  # aggregation_only_ns accumulates around Tally.add_vote inside the
+  # aggregation_time_ns span, so it must be strictly inside it. Zero means the
+  # accumulator never fired and the crypto share would be a claim about work
+  # nobody timed; at or above the parent means it is not measuring what it
+  # says. One tally per cell, so these are single values, not medians.
+  at = [r['value'] for r in records if r['metric'] == 'aggregation_time_ns']
+  ao = [r['value'] for r in records if r['metric'] == 'aggregation_only_ns']
+  if at and ao:
+    pt, po = at[0], ao[0]
+    if not 0 < po < pt:
+      c.fail('aggregation_only_ns within aggregation_time_ns',
+             f'{po / 1e6:.1f} ms vs {pt / 1e6:.1f} ms — the homomorphic '
+             f'multiplication is not strictly inside the loop containing it')
+    else:
+      c.ok('aggregation_only_ns within aggregation_time_ns',
+           f'{100 * po / pt:.1f}% is homomorphic multiplication, '
+           f'{100 * (pt - po) / pt:.1f}% deserialization and row iteration')
+
+  # --- payload sizes ------------------------------------------------------
+  # Two from the harness, two from Helios.
+  PAYLOADS = {'cast_payload_bytes', 'election_json_bytes',
+              'decryption_factors_bytes', 'decryption_proofs_bytes'}
+  present_payloads = PAYLOADS & {r['metric'] for r in records}
+  if present_payloads:
+    missing_p = PAYLOADS - present_payloads
+    (c.ok if not missing_p else c.fail)(
+      'all payload metrics present',
+      f'{len(present_payloads)}/{len(PAYLOADS)}'
+      if not missing_p else 'missing: ' + ', '.join(sorted(missing_p)))
+
+    # The wire payload must exceed the cryptographic content it wraps: JSON
+    # structure, wrapper fields and form-encoding all add bytes the
+    # ciphertext+proof figure does not describe.
+    cp = [r['value'] for r in records if r['metric'] == 'cast_payload_bytes']
+    ct = [r['value'] for r in records if r['metric'] == 'ciphertext_bytes']
+    pf = [r['value'] for r in records if r['metric'] == 'proof_bytes']
+    if cp and ct and pf:
+      n = min(len(ct), len(pf))
+      worst = max(ct[i] + pf[i] for i in range(n))
+      if min(cp) > worst:
+        c.ok('cast payload exceeds ciphertext+proof',
+             f'{min(cp) / 1024:.1f} KiB on the wire vs '
+             f'{worst / 1024:.1f} KiB of crypto content '
+             f'(+{100 * (min(cp) - worst) / worst:.1f}%)')
+      else:
+        c.fail('cast payload exceeds ciphertext+proof',
+               f'smallest payload {min(cp)} <= largest content {worst}')
+
   bad_env = [r for r in records if not ENV_KEYS <= set(r.get('env', {}))]
   (c.ok if not bad_env else c.fail)(
     'env captured per record (§4.1)',
@@ -303,9 +567,27 @@ def check(path, expected_n=10):
   else:
     c.ok('no tally-time verification, matching Election.compute_tally')
 
-  keygen = [r for r in records if r['metric'] == 'keygen_time_ns']
-  (c.ok if len(keygen) >= 30 else c.fail)(
-    'keygen sampled >= 30 times (§3.3)', f'{len(keygen)} samples')
+  # Key generation is measured inside Helios, once per election, for the key
+  # the election actually used. There is no 30-sample harness population any
+  # more: the distribution comes from repeated cells, and pooling a microbench
+  # with a real-flow measurement would average across two processes.
+  kg = [r for r in records if r['metric'] == 'keygen_time_ns']
+  kg_election = [r for r in kg
+                 if r.get('extra', {}).get('context') == 'election']
+  if not kg:
+    c.fail('keygen recorded', 'no keygen_time_ns record')
+  elif len(kg_election) == 1 and len(kg) == 1:
+    c.ok('keygen recorded once, in the real flow',
+         f'{kg_election[0]["value"] / 1e6:.2f} ms, '
+         f'source={kg_election[0].get("extra", {}).get("source")}')
+  elif not kg_election:
+    c.fail('keygen recorded in the real flow',
+           f'{len(kg)} keygen record(s), none with context=election — the '
+           f'election\'s own key generation was not measured')
+  else:
+    c.warn('keygen recorded once, in the real flow',
+           f'{len(kg)} keygen records ({len(kg_election)} from the election) — '
+           f'expected exactly one per cell')
 
   # --- values are plausible, not merely present --------------------------
   nonpositive = [r for r in records
@@ -332,8 +614,10 @@ def check(path, expected_n=10):
   if spec.has_dlog:
     pre = [r for r in records if r['metric'] == 'dlog_precompute_time_ns']
     if pre and all(r['value'] > 0 for r in pre):
+      n_entries = (pre[0]['extra'].get('dlog_entries')
+                   or pre[0]['extra'].get('num_tallied'))
       c.ok('dlog precompute ran', f'{pre[0]["value"] / 1e6:.1f} ms for '
-                                  f'{pre[0]["extra"].get("dlog_entries")} entries')
+                                  f'{n_entries} entries')
     elif pre:
       c.fail('dlog precompute ran', 'zero time — the Θ(N) step did not execute')
     else:

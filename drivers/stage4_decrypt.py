@@ -1,89 +1,97 @@
 """
-Stage 4 — decryption (spec §3.7).
+Stage 4 — decryption, driven through Helios's own endpoints.
 
-Decryption is reported as THREE numbers, not one. Spec §2.3 calls this
-decomposition "the single most informative chart in the results section, and it is
-only possible if you plan for it now":
+This stage drives the phase and waits for its signal. It times nothing: the
+crypto is timed inside Helios (helios/measure.py, branch
+measure/instrumentation) and reaches the harness through the sidecar, joined on
+election uuid.
 
-  decryption_factor_time   ElGamal: alpha^x + Chaum-Pedersen proofs
-                           Paillier: plaintexts + Pi_root proofs
-  dlog_precompute_time     ElGamal: DLogTable.precompute -- Theta(N)
-                           Paillier: DOES NOT EXIST
-  dlog_lookup_time         ElGamal: the O(1) dict lookups + factor combination
-                           Paillier: pass-through
+Two steps, reached differently:
 
-The point is structural, not incidental. Helios does not use BSGS; it walks
-g^0..g^N into a dict (§0.1). So ElGamal's decryption cost grows linearly with the
-number of voters and is INDEPENDENT of how votes are distributed, while Paillier
-has no dlog step at all. Reporting one combined "decryption time" would hide
-exactly the difference the thesis exists to measure.
+  decryption factors   tally_helios_decrypt, a Celery task CHAINED off the
+                       /compute_tally POST Stage 3 already made. This stage
+                       does not request it -- it waits for its signal.
+  combine              /combine_decryptions, SYNCHRONOUS: Helios runs
+                       combine_decryptions() inside the request, so the result
+                       is ready when the POST returns.
 
-How the split is obtained without touching Helios
--------------------------------------------------
-Tally.decrypt_from_factors (electionalgs.py:775) builds its own DLogTable and calls
-precompute internally, so the phases cannot be timed from outside directly. Rather
-than modify Helios -- which would break the "no modifications to ElGamal-Helios"
-constraint (§9.2.1) -- this stage times the whole call, then separately times an
-identically-constructed DLogTable.precompute over the same range. Lookup+combine is
-the remainder.
+Decryption arrives in the sidecar already decomposed, and the dlog split is
+DIRECTLY MEASURED rather than derived:
 
-That makes dlog_lookup_time a derived quantity carrying both measurements' noise.
-It is recorded as such in `extra.derived`, so the analysis stage never mistakes it
-for a directly observed number.
+  decryption_factor_time_ns    alpha^x + Chaum-Pedersen proofs, in the worker
+  dlog_precompute_time_ns      DLogTable.precompute -- Theta(N)
+  dlog_lookup_time_ns          per-cell decrypt() + the O(1) lookups
+
+That structure is the point of the thesis: Helios walks g^0..g^N into a dict
+rather than using BSGS, so ElGamal's decryption grows linearly with the number
+of voters, while Paillier has no dlog step at all. Reporting one combined
+"decryption time" would hide exactly the difference being measured.
+
+Why the poll is an EXISTS query
+-------------------------------
+trustee.decryption_factors is an LDObjectField, and
+Election.get_helios_trustee() does len() on a queryset -- loading every
+trustee's secret key and factors. Polling either would repeat that work every
+50 ms on the same machine as the worker being timed. The predicate below asks
+the database whether the column is non-NULL and never transfers the value.
 """
 
-from emit import Timer
+from drivers.http_client import HeliosSession, await_signal, close_stale_connection
 
 
-def decrypt(election, tally, log=print):
+def _factors_present(uuid):
+  from helios.models import Trustee
+  return Trustee.objects.filter(election__uuid=uuid,
+                                secret_key__isnull=False,
+                                decryption_factors__isnull=False).exists()
+
+
+def await_factors(*, election_uuid, since_ns, poll_s=0.05, timeout_s=3600,
+                  log=print):
   """
-  Returns a dict of phase timings plus the decrypted result.
+  Wait for the chained tally_helios_decrypt task to publish its factors.
 
-  Uses the Tally object Stage 3 actually built.
+  `since_ns` is Stage 3's signal instant, used only for the progress log. No
+  POST is issued here -- the task was already triggered by Stage 3's
+  /compute_tally.
+
+  Returns {'signal_ns'}. The wait itself is the point: combine must not run
+  before the factors exist.
   """
   import helios_env
   helios_env.setup_django()
-  # Production class, matching Stage 3
-  from helios.workflows.homomorphic import DLogTable
 
-  # We need the helios private key and then the public key for decryption
-  sk = election.get_helios_trustee().secret_key
-  pk = election.public_key
+  close_stale_connection()
+  t2 = await_signal(lambda: _factors_present(election_uuid),
+                    poll_s, timeout_s, 'decryption_factors', since_ns, log)
+  return {'signal_ns': t2}
 
-  # from Tally object --  array of decryption factors and a corresponding array of decryption proofs
-  with Timer() as t_factors:
-    factors, proofs = tally.decryption_factors_and_proofs(sk)
 
-  # decrypt_from_factors: combines decryption factors into each cell's ciphertext
-  # AND builds its own dlog table internally (precompute cost isolated below)
-  with Timer() as t_combine:
-    result = tally.decrypt_from_factors([factors], pk)
+def combine(*, base_url, election_uuid, log=print):
+  """
+  POST /combine_decryptions and return the decrypted result.
+  """
+  import helios_env
+  helios_env.setup_django()
+  from helios.models import Election
 
-  with Timer() as t_precompute: # Rebuild the same dlog table standalone, to isolate its cost
-    table = DLogTable(base=pk.g, modulus=pk.p)
-    table.precompute(tally.num_tallied)
+  if not _factors_present(election_uuid):
+    raise RuntimeError(
+      'decryption factors not present; combine_decryptions would produce a '
+      'wrong result. await_factors() must reach its signal first.')
 
-  # decrypt_from_factors' work minus its internal precompute — i.e. per-cell
-  # decrypt() + O(1) table lookups
-  decrypt_and_lookup_ns = max(t_combine.ns - t_precompute.ns, 0)
+  s = HeliosSession(base_url).login_devlogin()
+  close_stale_connection()
 
-  log(f'phase 1  decryption factors + CP proofs   '
-      f'{t_factors.ns / 1e6:9.2f} ms')
-  log(f'phase 2  combine + dlog recovery          '
-      f'{t_combine.ns / 1e6:9.2f} ms')
-  log(f'   of which  DLogTable.precompute         '
-      f'{t_precompute.ns / 1e6:9.2f} ms  '
-      f'({tally.num_tallied} entries, Theta(N))')
-  log(f'   remainder lookup + combine             '
-      f'{decrypt_and_lookup_ns / 1e6:9.2f} ms  DERIVED')
-  log(f'result: {result}')
+  # Unbounded by design: combine_decryptions runs DLogTable.precompute(N)
+  # inside the request, so at large N this blocks. requests sets no default
+  # timeout, so it waits rather than failing spuriously.
+  log('POST /combine_decryptions (synchronous — runs inside the request)')
+  s.post(f'/helios/elections/{election_uuid}/combine_decryptions',
+         data={}, expect_redirect=False)
 
-  return {
-    'result': result,
-    'decryption_factor_time_ns': t_factors.ns,
-    'decryption_combine_time_ns': t_combine.ns,
-    'dlog_precompute_time_ns': t_precompute.ns,
-    'dlog_lookup_time_ns': decrypt_and_lookup_ns,
-    'dlog_entries': tally.num_tallied,
-    'proofs': proofs,
-  }
+  result = Election.objects.get(uuid=election_uuid).result
+  if result is None:
+    raise RuntimeError('combine_decryptions returned but election.result is null')
+
+  return result

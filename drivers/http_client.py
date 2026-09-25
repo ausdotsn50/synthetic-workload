@@ -1,10 +1,51 @@
 """
-Session-based HTTP client for Helios.
+Session-based HTTP client for Helios, plus the two helpers every stage that
+waits on a Celery-completed phase needs.
+
+Helios writes no completion timestamp -- tallying_finished_at and
+tallies_combined_at are declared (models.py:132-133) but only ever set in
+helios/tests.py -- so a stage driven through an async endpoint has to observe
+its own signal by polling. The generic loop lives here; each stage owns the
+predicate for the signal that belongs to it.
 """
 
 import re
+import time
 
 import requests
+
+
+def close_stale_connection():
+  """
+  Drop the harness's database connection once, before polling begins.
+
+  Django is in autocommit, so every later query sees the worker's committed
+  writes without reconnecting. Closing on each poll (50 ms) would add thousands
+  of reconnects during the wait.
+  """
+  from django.db import connection
+  connection.close()
+
+
+def await_signal(predicate, poll_s, timeout_s, what, since_ns, log=print):
+  """
+  Poll until `predicate` is true; return the perf_counter_ns at that moment.
+
+  Reports every 15 s. A tally at large N runs for minutes with no output of its
+  own, and a silent wait is indistinguishable from a hang.
+  """
+  deadline = time.time() + timeout_s
+  next_report = time.time() + 15.0
+  while time.time() < deadline:
+    if predicate():
+      return time.perf_counter_ns()
+    if time.time() >= next_report:
+      log(f'  waiting on {what} — '
+          f'{(time.perf_counter_ns() - since_ns) / 1e9:.0f}s elapsed')
+      next_report += 15.0
+    time.sleep(poll_s)
+  raise TimeoutError(
+    f'{what} did not appear after {timeout_s}s. Is the Celery worker running?')
 
 # The hidden input Helios's templates render. Attribute order is consistent
 # across every template that emits it (see helios/templates/*.html).
