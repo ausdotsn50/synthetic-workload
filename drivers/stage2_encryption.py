@@ -3,7 +3,8 @@ Stage 2 — encryption measurement AND board population, both in a real browser
 
 This module loads the booth page and drives the SAME `HELIOS.EncryptedAnswer`
 constructor via `driver.execute_script`, timing it with performance.now() in page
-context.
+context. The same code drives every arm: the booth dispatches on the election's
+key, and the harness only tells the proof probe which scheme's prototype to wrap.
 """
 
 import json
@@ -13,8 +14,9 @@ import time
 from urllib.parse import urlencode
 
 import console
+import schemes
 
-# Headless webdriver 
+# Headless webdriver
 def _driver(headless=True):
   from selenium import webdriver
   from selenium.webdriver.chrome.options import Options
@@ -43,12 +45,14 @@ return window.__workload_election.questions.length;
 
 # ZKP timing probe.
 #
-# Every proof in a ballot is produced by one function:
-# ElGamal.Ciphertext.prototype.generateDisjunctiveProof (elgamal.js:245).
+# Every proof in a ballot is produced by one function per scheme:
+# ElGamal.Ciphertext.prototype.generateDisjunctiveProof (elgamal.js:245) or
+# Paillier.Ciphertext.prototype.generateDisjunctiveProof (paillier.js:375).
 # doEncryption calls it once per answer slot for the individual proofs
-# (helios.js:280) and once more per question for the overall proof
-# (helios.js:307), so wrapping it captures all ballot proof generation and
-# nothing else.
+# (helios.js:270) and once more per question for the overall proof
+# (helios.js:298), so wrapping the scheme's own one captures all ballot proof
+# generation and nothing else. The scheme is passed in rather than guessed: the
+# booth loads both libraries, and wrapping the other one would record nothing.
 #
 # The wrapper calls the original through .apply and returns its value untouched.
 # Helios's own loop still drives the work, the proof that goes into the cast
@@ -57,22 +61,45 @@ return window.__workload_election.questions.length;
 # models.py times self.vote.verify inside it.
 #
 # What falls on the non-proof side is everything doEncryption does around these
-# calls: generate_plaintexts, the ElGamal.encrypt per slot, the hom_sum/rand_sum
-# loops, array construction. The hom_sum loop exists only to feed the overall
-# proof, but it is not proof generation, and moving it across the line would
-# mean judging Helios's code instead of timing it.
+# calls: generate_plaintexts, pk.encrypt per slot, the hom_sum/rand_sum loops,
+# array construction. The hom_sum loop exists only to feed the overall proof,
+# but it is not proof generation, and moving it across the line would mean
+# judging Helios's code instead of timing it.
+#
+# Under Paillier DJN §4.1 ('short' and 'long') the Pi_root witness h^a mod n is
+# derived from the stored exponent inside the proof itself
+# (Paillier.Ciphertext.generateProof -> pk.proofWitness), so it counts as proof
+# time. The ciphertext's own hn^a stays on the encryption side, where 'off''s
+# v^n and ElGamal's encryption are.
 _INSTALL_ZKP_PROBE_JS = r"""
-const proto = (typeof ElGamal !== 'undefined' && ElGamal.Ciphertext)
-    ? ElGamal.Ciphertext.prototype : null;
+const [scheme] = arguments;
+const libName = scheme === 'paillier' ? 'Paillier' : 'ElGamal';
+const lib = scheme === 'paillier'
+    ? (typeof Paillier !== 'undefined' ? Paillier : null)
+    : (typeof ElGamal !== 'undefined' ? ElGamal : null);
+const target = libName + '.Ciphertext.prototype';
+const proto = (lib && lib.Ciphertext) ? lib.Ciphertext.prototype : null;
 if (!proto) {
-  throw new Error('ElGamal.Ciphertext.prototype is not reachable on the booth '
-                  + 'page, so there is nothing to wrap and encryption proof '
-                  + 'time cannot be measured');
+  throw new Error(target + ' is not reachable on the booth page, so there is '
+                  + 'nothing to wrap and encryption proof time cannot be '
+                  + 'measured');
+}
+
+// The key the booth parsed must belong to the same scheme: its ciphertexts are
+// the ones whose prototype is wrapped. A key of the other scheme would encrypt
+// through the other prototype and never reach the wrapper.
+const election = window.__workload_election;
+const pk = election ? election.public_key : null;
+if (!(lib.PublicKey && pk instanceof lib.PublicKey)) {
+  throw new Error('the election key parsed on the booth page is not '
+                  + (libName === 'ElGamal' ? 'an ' : 'a ') + libName
+                  + '.PublicKey, so its encryptions would never reach '
+                  + target + '.generateDisjunctiveProof');
 }
 
 const current = proto.generateDisjunctiveProof;
 if (typeof current !== 'function') {
-  throw new Error('ElGamal.Ciphertext.prototype.generateDisjunctiveProof is '
+  throw new Error(target + '.generateDisjunctiveProof is '
                   + (typeof current) + ', not a function — this booth build has '
                   + 'moved the proof entry point, and installing the probe '
                   + 'anyway would silently measure nothing');
@@ -81,10 +108,14 @@ if (typeof current !== 'function') {
 // Idempotent. A second install would nest one wrapper inside the other and
 // bill every proof twice.
 if (window.__workload_zkp) {
-  return {installed: true, already_installed: true};
+  if (window.__workload_zkp.target !== target) {
+    throw new Error('the ZKP probe is already installed on '
+                    + window.__workload_zkp.target + ', not ' + target);
+  }
+  return {installed: true, already_installed: true, target: target};
 }
 
-const acc = {ms: 0.0, calls: 0};
+const acc = {ms: 0.0, calls: 0, target: target};
 window.__workload_zkp = acc;
 proto.generateDisjunctiveProof = function() {
   const s = performance.now();
@@ -93,7 +124,46 @@ proto.generateDisjunctiveProof = function() {
   acc.calls += 1;
   return out;
 };
-return {installed: true, already_installed: false};
+return {installed: true, already_installed: false, target: target};
+"""
+
+# DJN §4.1 fixed-base tables, built and timed on their own (W7).
+#
+# Under 'short' and 'long' the key caches [hn^(2^i) mod n^2] and [h^(2^i) mod n]
+# (paillier.js, PublicKey.fixedBaseTables), built on the first encryption and
+# reused by every later one. Left alone, the build would land inside the
+# discarded warm-up ballot and be recorded nowhere. Building it here, before the
+# probe and the warm-up, times it exactly once per page load -- which in real
+# use is once per voter, before their ballot -- and keeps it out of every
+# encryption_time_ms.
+_BUILD_DJN41_TABLES_JS = r"""
+const [mode] = arguments;
+const election = window.__workload_election;
+const pk = election ? election.public_key : null;
+if (!(typeof Paillier !== 'undefined' && pk instanceof Paillier.PublicKey)) {
+  throw new Error('the election key on the booth page is not a '
+                  + 'Paillier.PublicKey, so there are no DJN tables to build');
+}
+if (pk.djn41_mode !== mode) {
+  throw new Error('the booth parsed the key in djn41_mode ' + pk.djn41_mode
+                  + ', but the election was created in ' + mode);
+}
+if (typeof pk.fixedBaseTables !== 'function') {
+  throw new Error('Paillier.PublicKey.fixedBaseTables is '
+                  + (typeof pk.fixedBaseTables) + ', not a function — this '
+                  + 'booth build has no fixed-base tables to time');
+}
+// Nothing may have built them yet, or part of the cost would already be paid
+// and this would time a cache hit.
+if (pk.tables !== null) {
+  throw new Error('the fixed-base tables already exist before the measured '
+                  + 'build, so their cost would be hidden');
+}
+
+const t0 = performance.now();
+const tables = pk.fixedBaseTables();
+const t1 = performance.now();
+return {build_ms: t1 - t0, hn_len: tables.hn.length, h_len: tables.h.length};
 """
 
 # See the ff. class in helios.js >> HELIOS.EncryptedAnswer = Class.extend({...})
@@ -123,7 +193,8 @@ const ea = new HELIOS.EncryptedAnswer(
     election.questions[qNum], answerIndexes, election.public_key);
 const t1 = performance.now();
 
-// Read immediately, before anything else on this page can call into ElGamal.
+// Read immediately, before anything else on this page can call into the
+// cryptosystem.
 const proof_ms = zkp.ms;
 const proof_calls = zkp.calls;
 
@@ -146,12 +217,13 @@ return {
 };
 """
 
-def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
-                       headless=True, warmup=1, log=print):
+def sample_encryptions(*, base_url, election_uuid, ballots, scheme,
+                       djn41_mode=None, out_path=None, headless=True, warmup=1,
+                       log=print):
   """
   Encrypt `ballots` in a real browser, one record per ballot.
 
-  Returns (samples, warmup_timings).
+  Returns (samples, warmup_timings, table_build).
 
   samples is [{timing_ms, proof_ms, ciphertext_bytes, proof_bytes}], summed
   across questions so each entry is a whole ballot. timing_ms covers the booth's
@@ -159,8 +231,14 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
   actually runs, not a harness-side re-creation of its parts.
 
   proof_ms is the part of timing_ms spent inside Helios's own
-  generateDisjunctiveProof, measured on the same single pass by the probe
-  installed below. Every ballot carries it; there is no second pass to sample.
+  generateDisjunctiveProof -- `scheme`'s own, ElGamal's or Paillier's --
+  measured on the same single pass by the probe installed below. Every ballot
+  carries it; there is no second pass to sample.
+
+  table_build is {build_ms, hn_len, h_len} under Paillier with `djn41_mode`
+  'short' or 'long': the one-time DJN §4.1 fixed-base table build, timed on its
+  own before the warm-up so that no encryption timing contains it. None under
+  ElGamal and under 'off', which have no tables.
 
   `warmup` ballots are encrypted and discarded before measurement begins: the
   first ballots of a cell read high against steady state (997/1100/843 ms vs
@@ -183,6 +261,7 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
   driver = _driver(headless=headless) # headless chrome webdriver
   samples = []
   warmup_timings = []
+  table_build = None
   out = open(out_path, 'w') if out_path else None
   # Cap the reporting interval: len//10 gives 20-minute blackouts at N=1000 on
   # the nle2025 face, which is indistinguishable from a hang.
@@ -204,11 +283,19 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
     n_q = driver.execute_script(_LOAD_ELECTION_JS, election_json)
     log(f'election parsed once into page context — {n_q} questions')
 
+    # DJN §4.1 only: build the fixed-base tables now, timed, so that neither
+    # the warm-up nor any measured ballot pays for them.
+    if scheme == 'paillier' and djn41_mode in schemes.DJN41_TABLE_MODES:
+      table_build = driver.execute_script(_BUILD_DJN41_TABLES_JS, djn41_mode)
+      log(f'DJN §4.1 fixed-base tables built in '
+          f'{table_build["build_ms"]:.0f} ms (hn: {table_build["hn_len"]} '
+          f'entries, h: {table_build["h_len"]})')
+
     # Before any encryption, warm-up included: the probe throws rather than
     # no-opping if the proof entry point is not where it should be.
-    driver.execute_script(_INSTALL_ZKP_PROBE_JS)
-    log('ZKP probe installed on '
-        'ElGamal.Ciphertext.prototype.generateDisjunctiveProof')
+    probe = driver.execute_script(_INSTALL_ZKP_PROBE_JS, scheme)
+    target = probe['target']
+    log(f'ZKP probe installed on {target}.generateDisjunctiveProof')
 
     """
     Visualization for ballots/ballot
@@ -263,8 +350,9 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
         if not r['proof_calls']:
           raise RuntimeError(
             f'ZKP probe recorded no calls while encrypting question {q_num} of '
-            f'ballot {i}. generateDisjunctiveProof was wrapped but never ran, '
-            f'so encryption_proof_ms cannot be measured for this run.')
+            f'ballot {i}. {target}.generateDisjunctiveProof was wrapped but '
+            f'never ran, so encryption_proof_ms cannot be measured for this '
+            f'run.')
 
         total['timing_ms'] += r['timing_ms']
         total['proof_ms'] += r['proof_ms']
@@ -286,7 +374,7 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
   prog.done()
   if out_path:
     log(f'wrote {out_path}')
-  return samples, warmup_timings
+  return samples, warmup_timings, table_build
 
 
 def load_encrypted(path):

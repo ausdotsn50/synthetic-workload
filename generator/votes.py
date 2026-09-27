@@ -1,9 +1,10 @@
 """
 Seeded plaintext vote generation.
 
-Every cell is reproducible from (base_seed, scheme, N, rep) alone — no shared RNG
+Every cell is reproducible from (base_seed, N, rep) alone — no shared RNG
 state between cells, so a single cell can be re-run in isolation and produce
-identical plaintext votes.
+identical plaintext votes. The scheme is deliberately not an input: see
+cell_seed.
 
 Note what is NOT modelled: a skewed / worst-case vote distribution. Spec §0.1 shows
 Helios recovers discrete logs from a precomputed table walked to `num_tallied`, not
@@ -18,12 +19,18 @@ import random
 # Same inputs, same plaintext ballots
 # Purpose: repoducibility
 # Ot: election seed; marked in .jsonl column
-def cell_seed(base_seed, scheme, N, rep):
+def cell_seed(base_seed, N, rep):
   """
   Derive a per-cell seed deterministically. Hashing rather than arithmetic mixing
   so neighbouring cells do not get correlated streams.
+
+  Neither the scheme nor the Paillier mode is hashed in, so all four arms --
+  elgamal and paillier off/short/long -- at the same (N, rep) cast identical
+  ballots and must produce identical tallies. That makes the comparison between
+  arms a paired one. The seed itself is recorded on every record, so any cell's
+  ballots can still be regenerated exactly.
   """
-  key = f'{base_seed}|{scheme}|{N}|{rep}'.encode()
+  key = f'{base_seed}|{N}|{rep}'.encode()
   return int.from_bytes(hashlib.sha256(key).digest()[:8], 'big')
 
 # Expand a ballot_face.yaml entry into Helios question dicts.
@@ -69,4 +76,22 @@ def generate_ballots(seed, questions, count):
   # To do: modify generate ballots mechanism
   rng = random.Random(seed) # Note: 424242 base seed only for randomization no crypto val
   return [generate_ballot(rng, questions) for _ in range(count)]
+
+
+def expected_tally(questions, ballots):
+  """
+  The tally the cast ballots must decrypt to, in the layout of Helios's
+  Election.result: per question, per answer, the number of ballots selecting
+  it. acceptance.py compares it with the decrypted result.
+
+  Checked against a real run before being relied on: regenerating the ballots of
+  results/2026-09-26T08:55:37Z-405d.jsonl (ElGamal, N=5, smoke face) from its
+  recorded seed gives [[0, 1, 1], [1, 0, 3]], the result Helios decrypted.
+  """
+  counts = [[0] * len(q['answers']) for q in questions]
+  for ballot in ballots:
+    for q_num, picks in enumerate(ballot):
+      for a in picks:
+        counts[q_num][a] += 1
+  return counts
 

@@ -1,6 +1,15 @@
 """
-Sample command:
+Sample commands, one per measured arm:
 - uv run --project ../helios-server python runner.py --face smoke --n 10
+- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier --djn41-mode off
+- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier --djn41-mode short
+- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier --djn41-mode long
+
+The arm is the scheme plus, under Paillier, its DJN §4.1 mode: elgamal,
+paillier-off, paillier-short, paillier-long. All four cast the same ballots at
+the same (N, rep) -- see generator/votes.py, cell_seed -- so arms compare
+pairwise. --djn41-mode and --crt-proofs default to the `paillier:` block in
+config/levels.yaml ('off' and CRT on, the server's own defaults).
 
 Execution is SERIAL by design (§3.8). At ~6.5 s of pure computation per ballot,
 concurrency on this machine would saturate CPU immediately and the numbers would
@@ -23,8 +32,58 @@ import preflight
 import schemes
 from emit import Emitter, make_run_id
 
+DJN41_MODES = ('off', 'short', 'long')
+
+# ElectionForm.short_name is a SlugField(max_length=40); a longer name is
+# refused by the form, and the election is never created.
+SHORT_NAME_MAX = 40
+
+
+def resolve_ablation(scheme, cfg, djn41_mode=None, crt_proofs=None):
+  """
+  The configuration a cell runs under, in Election.ablation_config's shape:
+  {} under ElGamal, {'paillier_djn41_mode', 'paillier_use_crt_proofs'} under
+  Paillier. A flag given on the command line wins over the `paillier:` block
+  in config/levels.yaml. Raises ValueError on a flag the scheme cannot take.
+  """
+  if scheme != 'paillier':
+    if djn41_mode is not None or crt_proofs is not None:
+      raise ValueError(f'--djn41-mode and --crt-proofs apply only to '
+                       f'--scheme paillier, and this cell is {scheme!r}')
+    return {}
+
+  p = cfg.get('paillier') or {}
+  mode = djn41_mode if djn41_mode is not None else p.get('djn41_mode', 'off')
+  if mode not in DJN41_MODES:
+    raise ValueError(
+      f'paillier djn41_mode is {mode!r}, not one of {DJN41_MODES}. In YAML a '
+      f"bare off is the boolean false: write it quoted, 'off'.")
+  crt = ((crt_proofs == 'on') if crt_proofs is not None
+         else p.get('crt_proofs', True))
+  if not isinstance(crt, bool):
+    raise ValueError(f'paillier crt_proofs is {crt!r}, not true or false')
+  return {'paillier_djn41_mode': mode, 'paillier_use_crt_proofs': crt}
+
+
+def arm_label(scheme, ablation):
+  """elgamal, or paillier-<djn41 mode>: the four measured arms."""
+  if scheme == 'paillier':
+    return f"paillier-{ablation['paillier_djn41_mode']}"
+  return scheme
+
+
+def short_name_for(arm, N, rep, run_id):
+  """The election's short_name, refused before anything runs if the form would
+  refuse it."""
+  name = f'wl-{arm}-n{N}-r{rep}-{run_id[-4:]}'
+  if len(name) > SHORT_NAME_MAX:
+    raise ValueError(f'election short_name {name!r} is {len(name)} characters; '
+                     f'Helios accepts at most {SHORT_NAME_MAX}')
+  return name
+
+
 # Cell run equivalent to one election run
-def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
+def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
              headless=True, skip=()):
   # Usage of seed for reproducibility purposes
   seed_base = cfg['seed']
@@ -35,9 +94,11 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   from generator import votes as votes_gen
   from generator import voters as voters_gen
 
-  seed = votes_gen.cell_seed(seed_base, scheme, N, rep)
+  arm = arm_label(scheme, ablation)
+  # Not keyed on the arm: every arm at this (N, rep) casts the same ballots.
+  seed = votes_gen.cell_seed(seed_base, N, rep)
   questions = votes_gen.build_questions(face)
-  short_name = f'wl-{scheme}-n{N}-r{rep}-{emitter.run_id[-4:]}' # Format for election short name
+  short_name = short_name_for(arm, N, rep, emitter.run_id) # Format for election short name
 
   n_answers = sum(len(q['answers']) for q in questions) # Sum of possible choices
 
@@ -46,6 +107,10 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
 
   # Record produced by emit in .json file
   def em(stage, metric, value, unit, extra=None):
+    # Every record, the harness's own and those joined from Helios, carries the
+    # configuration the election ran under, in Election.ablation_config's
+    # shape ({} under ElGamal). acceptance.py checks it against the election.
+    extra = {**(extra or {}), 'ablation': ablation}
     r = emitter.emit(scheme=scheme, N=N, rep=rep, seed=seed, stage=stage,
                      metric=metric, value=value, unit=unit, extra=extra)
     records.append(r)
@@ -59,7 +124,11 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
   # Header formatted
   console.title('HELIOS WORKLOAD — cell execution')
   console.field('run_id', emitter.run_id)
+  console.field('arm', arm)
   console.field('scheme', scheme)
+  if ablation:
+    console.field('ablation', ', '.join(f'{k}={v}'
+                                        for k, v in sorted(ablation.items())))
   console.field('N (voters)', N)
   console.field('rep', rep)
   console.field('ballot face', f'{face_key} — {len(questions)} questions, '
@@ -81,13 +150,15 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     # Election uuid found via short name function in stage0_configure
     election_uuid = stage0_configure.configure( # Note: uuid creation upon the following configure
       base_url=base_url, short_name=short_name,
-      name=f'Workload {scheme} N={N} rep={rep}',
-      questions=questions, n_voters=N, log=log)
-  
+      name=f'Workload {arm} N={N} rep={rep}',
+      questions=questions, n_voters=N, scheme=scheme, ablation=ablation,
+      log=log)
+
   # time_perf_counter_ns ends at with... as... statement
   stage_wall('configure', 'stage 0 configure', stg_zero.wall)
   em('configure', 'election_created', 1, 'count',
      {'election_uuid': election_uuid, 'short_name': short_name,
+      'arm': arm, 'ballot_face': face_key,
       'n_questions': len(questions), 'n_answers': n_answers})
 
   # Stage 1 - freeze election
@@ -138,11 +209,23 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
 
     enc_cfg = cfg.get('encryption', {})
     t0 = time.perf_counter()
-    samples, warmup_timings = stage2_encryption.sample_encryptions(
+    samples, warmup_timings, table_build = stage2_encryption.sample_encryptions(
       base_url=base_url, election_uuid=election_uuid, ballots=ballots,
+      scheme=scheme, djn41_mode=ablation.get('paillier_djn41_mode'),
       out_path=out_path, headless=headless,
       warmup=enc_cfg.get('warmup_ballots', 1), log=log)
     stage_wall('encrypt', 'stage 2 encrypt', time.perf_counter() - t0)
+
+    # Paillier 'short' and 'long' only: the booth's one-time DJN §4.1
+    # fixed-base table build, timed on its own before the warm-up. Once per
+    # cell, because the booth builds the tables once per page load.
+    if table_build is not None:
+      em('encrypt', 'djn41_table_build_ms', table_build['build_ms'], 'ms',
+         {'tier': 'operation', 'source': 'browser',
+          'hn_table_len': table_build['hn_len'],
+          'h_table_len': table_build['h_len'],
+          'note': 'built once per booth page load, so in real use once per '
+                  'voter, before their ballot; encryption_time_ms excludes it'})
 
     # Discarded warm-up ballots: kept in the record, excluded from analysis.
     for i, t in enumerate(warmup_timings):
@@ -162,8 +245,8 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       # Helios's proof generation, not a re-creation of it.
       em('encrypt', 'encryption_proof_ms', s['proof_ms'], 'ms',
           {'tier': 'operation', 'source': 'browser', 'sample': i})
-      # The remainder -- plaintext setup, the ElGamal.encrypt per answer slot,
-      # the homomorphic sum that feeds the overall proof -- is not recorded.
+      # The remainder -- plaintext setup, the pk.encrypt per answer slot, the
+      # homomorphic sum that feeds the overall proof -- is not recorded.
       # It was encryption_time_ms minus encryption_proof_ms on the same ballot,
       # both emitted just above under the same sample index, so the third
       # record held nothing the first two did not, once per ballot. The ZKP
@@ -201,9 +284,10 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
 
   # ---- STAGES 3+4 · THE REAL FLOW, INSTRUMENTED -----------------------------
   # There is exactly ONE execution. Each stage drives its own phase through the
-  # endpoint an administrator uses; Helios (branch measure/instrumentation)
-  # times its own calls from the inside and appends them to the sidecar. The
-  # harness joins on election uuid. Nothing is re-executed to be measured.
+  # endpoint an administrator uses; Helios (helios/measure.py -- on master, and
+  # merged into paillier-helios, which the server runs) times its own calls
+  # from the inside and appends them to the sidecar. The harness joins on
+  # election uuid. Nothing is re-executed to be measured.
   from drivers import stage3_aggregate, stage4_decrypt, measure_join
 
   m_cfg = cfg.get('measurement', {})
@@ -239,7 +323,11 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
       base_url=base_url, election_uuid=election_uuid, log=log)
   stage_wall('decrypt', 'stage 4 decrypt', st4.wall)
 
-  em('decrypt', 'result', result, 'tally', {'election_uuid': election_uuid})
+  # The tally these exact ballots must decrypt to, counted in the clear from the
+  # plaintexts. acceptance.py fails the cell unless Helios's result equals it.
+  em('decrypt', 'result', result, 'tally',
+     {'election_uuid': election_uuid,
+      'expected': votes_gen.expected_tally(questions, ballots)})
 
   # ---- join Helios's own timings --------------------------------------------
   console.section('INSTRUMENTATION · joined from Helios sidecar')
@@ -248,8 +336,9 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     msg = (f'no instrumentation records for election {election_uuid} in '
            f'{sidecar or "(no sidecar_path configured)"}.\n'
            f'  HELIOS_MEASURE_PATH must be set for BOTH the Django process and '
-           f'the Celery worker, and helios-server must be on the '
-           f'measure/instrumentation branch.')
+           f'the Celery worker (source measure-env.sh before starting each), '
+           f'and helios-server must carry helios/measure.py -- master, or '
+           f'paillier-helios, which has it merged.')
     if m_cfg.get('require_instrumentation', True):
       raise RuntimeError(msg)
     console.warn(msg)
@@ -271,9 +360,12 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, face_key='?',
     console.ok(f'{len(_all)} records joined from {len(_pids)} process(es): '
                + ', '.join(str(p) for p in _pids))
     if len(_pids) < 2:
+      web_metrics = ('keygen, prove_sk and both dlog metrics'
+                     if schemes.get(scheme).has_dlog
+                     else 'keygen and decryption_time_ns')
       console.warn('all records from a single process — expected two (Django '
-                   'web + Celery worker). The web process records keygen, '
-                   'prove_sk and both dlog metrics; if those are '
+                   f'web + Celery worker). The web process records '
+                   f'{web_metrics}; if those are '
                    'absent, Django was started without HELIOS_MEASURE_PATH '
                    'and must be restarted, not just re-exported.')
 
@@ -304,6 +396,12 @@ def main(argv=None):
   # Parse CLI args
   p = argparse.ArgumentParser(description='Run one workload cell (spec PART 3)')
   p.add_argument('--scheme', default=None, help='default: first in levels.yaml')
+  # Paillier only. Unset means the `paillier:` block in levels.yaml.
+  p.add_argument('--djn41-mode', choices=DJN41_MODES, default=None,
+                 help="Paillier encryption function: 'off' (standard), or DJN "
+                      "§4.1 'short' or 'long'; default from levels.yaml")
+  p.add_argument('--crt-proofs', choices=('on', 'off'), default=None,
+                 help='Paillier CRT decryption proofs; default from levels.yaml')
   p.add_argument('--n', type=int, default=None, help='default: first level')
   p.add_argument('--rep', type=int, default=0)
   p.add_argument('--face', default=None, help='ballot face key; default from config')
@@ -338,6 +436,18 @@ def main(argv=None):
     console.fail(str(e) if isinstance(e, schemes.UnsupportedScheme) else e.args[0])
     return 2
 
+  # The arm, settled before anything runs: a flag the scheme cannot take, or a
+  # short_name the form would refuse, stops the cell here rather than halfway.
+  # The run id's suffix is always 4 characters, so a placeholder sizes the name.
+  try:
+    ablation = resolve_ablation(scheme, cfg, djn41_mode=args.djn41_mode,
+                                crt_proofs=args.crt_proofs)
+    short_name_for(arm_label(scheme, ablation), N, args.rep, 'xxxx')
+  except ValueError as e:
+    console.section('ABORTED')
+    console.fail(str(e))
+    return 2
+
   if not args.no_preflight:
     if not preflight.check(base_url, need_browser=('2a' not in skip),
                            strict=args.strict):
@@ -348,7 +458,7 @@ def main(argv=None):
   with Emitter(run_id) as em:
     try:
       out = run_cell(scheme=scheme, N=N, rep=args.rep, cfg=cfg, face=face,
-                     emitter=em, face_key=face_key,
+                     emitter=em, ablation=ablation, face_key=face_key,
                      headless=not args.headed, skip=skip)
     except Exception as e:
       console.section('ABORTED')

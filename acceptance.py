@@ -1,7 +1,11 @@
 """
 Milestone 2 acceptance test.
 
-    uv run --project ../helios-server python acceptance.py results/<run_id>.jsonl
+    uv run --project ../helios-server python acceptance.py results/<run_id>.jsonl [N]
+
+The same checks apply to all four arms (elgamal, paillier-off, paillier-short,
+paillier-long); which metrics are required or forbidden follows from the
+scheme and the ablation the records claim, both checked against the election.
 
 Spec PART 5 defines Milestone 2 as done when "Stages 0-4 produce JSONL for N = 10".
 That is a floor, not a definition of correct: a harness can emit well-formed JSONL
@@ -162,6 +166,38 @@ def _observed_ablation(records):
     return None, f'database unreachable: {type(exc).__name__}: {exc}'
 
 
+def _observed_key_mode(records):
+  """
+  Read the DJN §4.1 mode off the election's public key itself.
+
+  One level below ablation_config: the row says what the election was set to
+  do, the key what the trustee actually generated. A 'short' key and a 'long'
+  key are otherwise identical, so the key carries its own mode, and a standard
+  key reads 'off'.
+
+  Returns (True, mode, evidence) -- mode None when the key has no DJN mode at
+  all, i.e. is not a Paillier key -- or (False, None, reason) when the key
+  cannot be read.
+  """
+  uuid = None
+  for r in records:
+    if r['metric'] == 'election_created':
+      uuid = r.get('extra', {}).get('election_uuid')
+  if not uuid:
+    return False, None, 'no election_uuid in the records'
+  try:
+    import helios_env
+    helios_env.setup_django()
+    from helios.models import Election
+    pk = Election.objects.get(uuid=uuid).public_key
+  except Exception as exc:
+    return False, None, f'database unreachable: {type(exc).__name__}: {exc}'
+  if pk is None:
+    return False, None, f'Election<{uuid}> has no public key'
+  return (True, getattr(pk, 'djn41_mode', None),
+          f'Election<{uuid}>.public_key ({type(pk).__name__})')
+
+
 def check(path, expected_n=10):
   c = Check()
   records, bad = load(path)
@@ -211,6 +247,10 @@ def check(path, expected_n=10):
         c.ok('emitted scheme matches what the run produced (§8.1)', why)
 
   # --- the ablation the records CLAIM, against what the election DID -------
+  # claimed_ablation also decides which metrics are required and forbidden
+  # below: DJN §4.1 'short' and 'long' add the booth's table build. It stays
+  # None when the records disagree or carry no stamp.
+  claimed_ablation = None
   claimed_ablations = {json.dumps(r.get('extra', {}).get('ablation'), sort_keys=True)
                        for r in records}
   if len(claimed_ablations) > 1:
@@ -218,6 +258,7 @@ def check(path, expected_n=10):
            f'found {len(claimed_ablations)} distinct configurations in one run')
   else:
     claimed = json.loads(claimed_ablations.pop())
+    claimed_ablation = claimed
 
     if claimed is None:
       if spec.key == 'paillier':
@@ -230,7 +271,8 @@ def check(path, expected_n=10):
              f'not applicable to {scheme}')
     else:
       c.ok('ablation configuration recorded',
-           ', '.join(f'{k}={v}' for k, v in sorted(claimed.items())))
+           ', '.join(f'{k}={v}' for k, v in sorted(claimed.items()))
+           or f'none — {scheme} has no ablation switches, stamped as {{}}')
 
       observed, why = _observed_ablation(records)
       if observed is None:
@@ -242,6 +284,19 @@ def check(path, expected_n=10):
       else:
         c.ok('emitted ablation matches what the election did', why)
 
+      # ...and against the key the trustee generated, which carries its mode.
+      claimed_mode = claimed.get('paillier_djn41_mode')
+      if claimed_mode is not None:
+        name = 'election key is in the claimed DJN §4.1 mode'
+        reachable, key_mode, why = _observed_key_mode(records)
+        if not reachable:
+          c.warn('key-level DJN §4.1 corroboration unavailable', why)
+        elif key_mode != claimed_mode:
+          c.fail(name, f'records claim {claimed_mode!r} but {why} is in '
+                       f'{key_mode!r} — this run is mislabeled')
+        else:
+          c.ok(name, f'{why}: {key_mode!r}')
+
   # --- schema ------------------------------------------------------------
   stages = {r['stage'] for r in records}
   missing = REQUIRED_STAGES - stages
@@ -251,7 +306,7 @@ def check(path, expected_n=10):
     else 'missing: ' + ', '.join(sorted(missing)))
 
   metrics = {r['metric'] for r in records}
-  required = schemes.required_metrics(scheme)
+  required = schemes.required_metrics(scheme, claimed_ablation)
   missing_m = required - metrics
   (c.ok if not missing_m else c.fail)(
     f'all required metrics present (for {scheme})',
@@ -259,7 +314,7 @@ def check(path, expected_n=10):
 
   # Symmetric to the above, and just as load-bearing: a Paillier run emitting
   # dlog_lookup_time_ns is reporting a stage that does not exist.
-  forbidden = schemes.forbidden_metrics(scheme) & metrics
+  forbidden = schemes.forbidden_metrics(scheme, claimed_ablation) & metrics
   (c.ok if not forbidden else c.fail)(
     f'no metrics emitted that {scheme} cannot produce',
     '' if not forbidden
@@ -278,8 +333,9 @@ def check(path, expected_n=10):
                   if _ex(r).get('source') == 'helios_instrumentation']
 
   # --- 8.1 instrumentation present ---------------------------------------
-  # Catches HELIOS_MEASURE_PATH unset on the worker, the measure/instrumentation
-  # branch not checked out, or a span dropped in a merge.
+  # Catches HELIOS_MEASURE_PATH unset on the worker, a helios-server checkout
+  # without helios/measure.py (it is on master, and merged into
+  # paillier-helios), or a span dropped in a merge.
   # Imported, not duplicated: a local copy drifted once already, leaving
   # acceptance checking a weaker set than the join required. measure_join is
   # the single source of truth for what Helios emits, and it imports only json
@@ -291,7 +347,8 @@ def check(path, expected_n=10):
            'empty or unreadable. Check HELIOS_MEASURE_PATH on BOTH the Django '
            'process and the Celery worker.')
   else:
-    required_i = REQUIRED_INSTRUMENTED - schemes.forbidden_metrics(scheme)
+    required_i = (REQUIRED_INSTRUMENTED
+                  - schemes.forbidden_metrics(scheme, claimed_ablation))
     missing_i = required_i - {r['metric'] for r in instrumented}
     (c.ok if not missing_i else c.fail)(
       f'all instrumented metrics present (for {scheme})',
@@ -307,16 +364,20 @@ def check(path, expected_n=10):
                                    'every number in it is suspect'))
 
     # --- 8.4 process separation ------------------------------------------
-    # Aggregation runs in the Celery worker, the dlog work in the web process.
-    # Equal pids mean the flow was not actually exercised across processes.
-    web = _by('dlog_lookup_time_ns', source='helios_instrumentation')
+    # Aggregation runs in the Celery worker, the final decode in the web
+    # process: the dlog lookup under ElGamal, decryption_time_ns (the same
+    # loop) under Paillier. Equal pids mean the flow was not actually
+    # exercised across processes.
+    web_metric = ('dlog_lookup_time_ns' if spec.has_dlog
+                  else 'decryption_time_ns')
+    web = _by(web_metric, source='helios_instrumentation')
     if aggs and web:
       pa, pc = _ex(aggs[0]).get('pid'), _ex(web[0]).get('pid')
       if pa is None or pc is None:
         c.warn('worker and web process are distinct', 'pid missing on a record')
       elif pa != pc:
         c.ok('worker and web process are distinct',
-             f'aggregation pid {pa}, dlog pid {pc}')
+             f'aggregation pid {pa}, {web_metric} pid {pc}')
       else:
         c.fail('worker and web process are distinct',
                f'both pid {pa} — either Celery ran eagerly in-process (a test '
@@ -640,6 +701,19 @@ def check(path, expected_n=10):
         n_votes = r['extra'].get('n_votes')
     totals = [sum(q) for q in tally] if tally else []
     c.ok('decrypted result present', f'per-question totals {totals}')
+
+    # Exact, not merely plausible: the runner counts the cast plaintexts in the
+    # clear, and every arm casts the same ballots, so all four must match it.
+    expected_tally = (res[-1].get('extra') or {}).get('expected')
+    name = 'decrypted result equals the tally of the cast ballots'
+    if expected_tally is None:
+      c.warn(name, 'no expected tally recorded — this run predates it, so '
+                   'only the bounds check below applies')
+    elif tally == expected_tally:
+      c.ok(name, f'{tally}')
+    else:
+      c.fail(name, f'Helios decrypted {tally}, but the cast plaintexts count '
+                   f'{expected_tally} — the tally or its decryption is wrong')
 
     # Each question's votes must sum to at most (max selections) x (voters). For a
     # max=1 question the total equals the number of voters who selected anything.

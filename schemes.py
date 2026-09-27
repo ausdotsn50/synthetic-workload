@@ -177,13 +177,28 @@ def observed_scheme(ciphertext_dict):
   return None
 
 
-def required_metrics(scheme):
+# The Paillier modes whose booth builds DJN §4.2 fixed-base tables before the
+# first encryption, and so emits djn41_table_build_ms.
+DJN41_TABLE_MODES = frozenset({'short', 'long'})
+
+
+def _djn41_mode(ablation):
+  """The paillier_djn41_mode a claimed ablation names, or None."""
+  return (ablation or {}).get('paillier_djn41_mode')
+
+
+def required_metrics(scheme, ablation=None):
   """
   Metrics a correct run of this scheme must emit (build spec §8.3).
 
   The dlog metrics are ElGamal-only. Under Paillier there is no discrete-log
   stage, so requiring them would fail a correct run, and emitting them as zero
   would be a claim about a step that never happened.
+
+  `ablation` is the configuration the run claims, in Election.ablation_config's
+  shape. Under Paillier 'short' and 'long' the booth's one-time table build,
+  djn41_table_build_ms, is required too. With no claimed ablation the mode is
+  unknown, so it is not.
   """
   s = get(scheme)
   metrics = {
@@ -199,18 +214,33 @@ def required_metrics(scheme):
     metrics |= {'dlog_precompute_time_ns', 'dlog_lookup_time_ns'}
   else:
     metrics |= {'decryption_time_ns'}
+  if _djn41_mode(ablation) in DJN41_TABLE_MODES:
+    metrics |= {'djn41_table_build_ms'}
   return metrics
 
 
-def forbidden_metrics(scheme):
+def forbidden_metrics(scheme, ablation=None):
   """
   Metrics this scheme must NOT emit.
 
   Symmetric to required_metrics and just as load-bearing: a Paillier run that
   emits dlog_lookup_time_ns is reporting a stage that does not exist, which is
   exactly the failure §8.2 describes.
+
+  Paillier also forbids prove_sk_time_ns. It has no trustee proof of knowledge
+  of the secret key (PaillierSecretKey.prove_sk returns None), so Helios runs
+  nothing and records nothing: the metric is absent by design, never a zero.
+
+  djn41_table_build_ms is forbidden wherever there are no tables to build:
+  under ElGamal, and under Paillier 'off'. With no claimed ablation a Paillier
+  run's mode is unknown, so the metric is neither required nor forbidden.
   """
   s = get(scheme)
   if s.has_dlog:
-    return {'decryption_time_ns'}
-  return {'dlog_precompute_time_ns', 'dlog_lookup_time_ns'}
+    return {'decryption_time_ns', 'djn41_table_build_ms'}
+  forbidden = {'dlog_precompute_time_ns', 'dlog_lookup_time_ns',
+               'prove_sk_time_ns'}
+  mode = _djn41_mode(ablation)
+  if mode is not None and mode not in DJN41_TABLE_MODES:
+    forbidden |= {'djn41_table_build_ms'}
+  return forbidden

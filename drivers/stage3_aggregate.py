@@ -3,9 +3,9 @@ Stage 3 — homomorphic aggregation, driven through Helios's own endpoint.
 
 This stage drives the phase and waits for its signal: it POSTs /compute_tally
 and polls until encrypted_tally appears. It times nothing. The aggregation is
-timed inside Helios (helios/measure.py, branch measure/instrumentation) and
-reaches the harness through the sidecar, joined on election uuid -- see
-drivers/measure_join.py.
+timed inside Helios (helios/measure.py -- on master, and merged into
+paillier-helios, which the server runs) and reaches the harness through the
+sidecar, joined on election uuid -- see drivers/measure_join.py.
 
 Why the poll is an EXISTS query
 -------------------------------

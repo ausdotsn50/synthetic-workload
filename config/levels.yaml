@@ -1,11 +1,26 @@
 # Default values for level config
+#
+# Four measured arms, one command each (runner.py runs one cell; add --n/--rep):
+#   elgamal         python runner.py
+#   paillier-off    python runner.py --scheme paillier --djn41-mode off
+#   paillier-short  python runner.py --scheme paillier --djn41-mode short
+#   paillier-long   python runner.py --scheme paillier --djn41-mode long
+# each prefixed with `uv run --project ../helios-server`. At the same (N, rep)
+# all four cast identical ballots (generator/votes.py, cell_seed), so the arms
+# compare pairwise.
 schemes:
-  - elgamal          
+  - elgamal
+
+# Paillier defaults, used when --djn41-mode / --crt-proofs are not given. These
+# are the server's own defaults: standard Paillier, CRT decryption proofs on.
+paillier:
+  djn41_mode: 'off'   # QUOTED: a bare off is YAML's boolean false
+  crt_proofs: true
 
 levels: # Electoral size/voter count
   - 10
 
-repetitions: 2
+repetitions: 3
 
 # For reproducibility, seed per config election run
 seed: 424242
@@ -31,9 +46,10 @@ bulk:
   pool_size: 5 # Temporarily removed pool_size logic
   stream: false
 
-# Timings are taken inside Helios's own code paths (helios-server branch
-# measure/instrumentation). The harness drives the real flow, polls for phase
-# completion, and joins the sidecar records on election uuid.
+# Timings are taken inside Helios's own code paths (helios/measure.py -- on
+# helios-server master, and merged into paillier-helios, which the server runs).
+# The harness drives the real flow, polls for phase completion, and joins the
+# sidecar records on election uuid.
 measurement:
   # FALLBACK ONLY. HELIOS_MEASURE_PATH takes precedence, because that is the
   # variable Helios itself reads — taking both from one place means the harness
