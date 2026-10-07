@@ -284,16 +284,34 @@ def summary(records, N):
     _p(f'  {"TOTAL":<22} {dur(total):>10}')
 
   # ---- projection -----------------------------------------------------------
-  # Whole-phase rates: a projection asks how long each phase takes.
+  # Whole-phase rates: a projection asks how long each phase takes. Only work
+  # that grows with the number of voters is projected.
   enc = _vals(records, 'encryption_time_ms', source='browser')
+  # DJN §4.1 'short'/'long' only: the booth builds its tables once per page
+  # load, which in real use is once per voter, so it is per-ballot work too.
+  tb = _vals(records, 'djn41_table_build_ms')
   agg = _vals(records, 'aggregation_time_ns')
   agg_per = agg[0] / _n_votes(records, N) if agg else None
+  # The dlog precompute walks g^0..g^N: the one decryption step that grows with
+  # N. The factor loop (factors + proofs), the per-answer dlog lookup and
+  # Paillier's decode run once per answer on the tally, so they are a fixed
+  # cost per election, reported but not projected.
   pre = _vals(records, 'dlog_precompute_time_ns')
   per_entry = pre[0] / _dlog_entries(records, N) if pre else None
-  ct, pf = _vals(records, 'ciphertext_bytes'), _vals(records, 'proof_bytes')
-  ballot_bytes = _median(ct) + _median(pf) if ct and pf else None
-  _projection(N, enc, agg_per, per_entry, ballot_bytes, stage_walls,
-              has_dlog=_has_dlog(records))
+  fixed = [v[0] for v in (_vals(records, m) for m in
+                          ('decryption_factor_time_ns', 'dlog_lookup_time_ns',
+                           'decryption_time_ns')) if v]
+  dec_fixed = sum(fixed) if fixed else None
+  # What the board holds: Helios stores each ballot's JSON twice, in Voter.vote
+  # and CastVote.vote. ciphertext + proof counts crypto content only and would
+  # understate it. This is text size; Postgres's TOAST compression puts less on
+  # disk (~73% of it in a 2026-10-07 check), which is not recorded per cell.
+  js = [r['extra']['json_bytes'] for r in records
+        if r['metric'] == 'cast_payload_bytes'
+        and r.get('extra', {}).get('json_bytes')]
+  stored = 2 * _median(js) if js else None
+  _projection(N, enc, tb[0] if tb else None, agg_per, per_entry, dec_fixed,
+              stored, stage_walls, has_dlog=_has_dlog(records))
 
 
 def _crypto_ops(records, N):
@@ -489,19 +507,23 @@ def _payload_timing(records, N):
     _row(label, value, note)
 
 
-def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
-                stage_walls, has_dlog=True):
+def _projection(N, enc_samples, table_build_ms, agg_per_ns, dlog_per_entry_ns,
+                dec_fixed_ns, stored_bytes, stage_walls, has_dlog=True):
   """
   Extrapolate this cell's measured per-ballot rates to larger electorates.
 
-  Linear extrapolation is defensible for exactly the quantities extrapolated
-  here: encryption is per-ballot independent work, aggregation is N modular
-  multiplications, dlog precompute is Theta(N) by construction (spec 0.1), and
-  storage is N x ballot size. It is NOT defensible for anything involving memory
-  pressure or database growth, which is why those are not projected.
+  Only work that grows with the number of voters is projected, and linear
+  extrapolation is defensible for exactly that: encryption is per-ballot
+  independent work (plus, under DJN §4.1 'short'/'long', the table build every
+  voter's booth pays once), aggregation is N modular multiplications, the dlog
+  precompute is Theta(N) by construction (spec 0.1), and storage is N x the
+  stored ballot. It is NOT defensible for anything involving memory pressure or
+  database growth, which is why those are not projected.
 
-  Without a discrete-log stage (has_dlog False: Paillier) there is no dlog
-  column at all, rather than one of dashes.
+  The decrypt column is the dlog precompute alone. The rest of decryption runs
+  once per answer on the aggregated tally, the same at every N, so it is printed
+  beneath the table as a fixed cost. Paillier has no decryption step that grows
+  with N, and the column shows that rather than disappearing.
   """
   if not (enc_samples or agg_per_ns):
     return
@@ -512,6 +534,8 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
   _p()
 
   enc_ms = _mean(enc_samples) if enc_samples else None
+  if enc_ms and table_build_ms:
+    enc_ms += table_build_ms
   cast_per = None
   if stage_walls and N:
     # Cast (HTTP login+cast+cast_confirm) + Celery verification drain, per
@@ -521,8 +545,7 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
                  + stage_walls.get('stage 2 verify', 0))
     cast_per = cast_wall / max(N, 1) if cast_wall else None
 
-  dlog_hdr = f'  {"dlog":>9}' if has_dlog else ''
-  hdr = f'  {"N":>9}  {"encrypt":>10}  {"cast+verify":>12}  {"aggregate":>10}{dlog_hdr}  {"storage":>10}'
+  hdr = f'  {"N":>9}  {"encrypt":>10}  {"cast+verify":>12}  {"aggregate":>10}  {"decrypt":>9}  {"storage":>10}'
   _p(hdr)
   _p('  ' + '-' * (len(hdr) - 2))
 
@@ -530,10 +553,9 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
     enc = dur(enc_ms * target / 1000) if enc_ms else '—'
     cast = dur(cast_per * target) if cast_per else '—'
     agg = dur(agg_per_ns * target / 1e9) if agg_per_ns else '—'
-    dl = dur(dlog_per_entry_ns * target / 1e9) if dlog_per_entry_ns else '—'
-    dl_col = f'  {dl:>9}' if has_dlog else ''
-    st = size(ballot_bytes * target) if ballot_bytes else '—'
-    _p(f'  {target:>9,}  {enc:>10}  {cast:>12}  {agg:>10}{dl_col}  {st:>10}')
+    dec = dur(dlog_per_entry_ns * target / 1e9) if dlog_per_entry_ns else '—'
+    st = size(stored_bytes * target) if stored_bytes else '—'
+    _p(f'  {target:>9,}  {enc:>10}  {cast:>12}  {agg:>10}  {dec:>9}  {st:>10}')
 
   _p()
   if enc_ms:
@@ -542,10 +564,24 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns, ballot_bytes,
     per_8h = int(28800 / (enc_ms / 1000))
     detail(f'At {enc_ms:.0f} ms/ballot this machine encrypts ~{per_8h:,} ballots '
            f'in 8 h, ~{per_day:,} in 24 h.')
-  if ballot_bytes:
-    gb = (100 << 30) / ballot_bytes
-    detail(f'At {size(ballot_bytes)}/ballot, 100 GiB of board holds '
-           f'~{int(gb):,} ballots.')
+  if enc_ms and table_build_ms:
+    detail(f'encrypt includes the DJN §4.1 table build, {_ms(table_build_ms)} per '
+           f'ballot: each voter\'s booth builds it once per page load.')
+  if has_dlog:
+    detail('decrypt is the dlog table precompute, the only decryption step that '
+           'grows with N.')
+  else:
+    detail('decrypt: no decryption step grows with N under this scheme.')
+  if dec_fixed_ns:
+    detail(f'Fixed per election, not projected: {dur(dec_fixed_ns / 1e9)} of '
+           f'decryption (factors + proofs, per-answer decode); it grows with the '
+           f'ballot\'s answers, not with N.')
+  if stored_bytes:
+    gb = (100 << 30) / stored_bytes
+    detail(f'storage is the ballot JSON, stored twice (Voter.vote and '
+           f'CastVote.vote): {size(stored_bytes)}/ballot as text. Postgres '
+           f'compresses large values, so disk use can be lower.')
+    detail(f'100 GiB of board holds ~{int(gb):,} ballots.')
 
 
 if __name__ == '__main__':
