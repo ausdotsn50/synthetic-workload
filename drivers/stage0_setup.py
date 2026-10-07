@@ -1,16 +1,29 @@
 """
-Stage 0 — election configuration
+Stage 0 — election setup, driven through Helios's own HTTP API
 
-Creates the election in the requested arm, saves the ballot face, uploads the
-voter list, opens eligibility. Driven through Helios's own HTTP API.
+Creates the election in the requested arm (the scheme and, under Paillier, the
+DJN §4.1 mode and CRT-proof flag) and confirms from the database that both the
+election row and the trustee key are that arm. Then saves the ballot face,
+uploads the voter list, and freezes the election.
 
-Measures nothing. Setup only -- apart from confirming, from the database, that
-the election is the arm that was asked for.
+The trustee key is made at creation, not at freeze: Helios's election_new view
+calls Election.generate_trustee, which times key generation itself
+(keygen_time_ns, plus prove_sk_time_ns where the scheme has that proof) and
+writes the records to the measurement sidecar from the web process.
+
+Voter-file processing is a Celery task, so configure() waits for the Voter rows
+before returning. Registration starts closed, so the uploaded list is the whole
+roll. Freezing locks the ballot and the roll, derives eligibility from the roll,
+sets the election public key from the trustee's, and opens voting.
+
+Times nothing itself: runner.py takes the stage wall clocks around configure()
+and freeze().
 """
 
 import json
 import time
 
+import console
 from drivers.http_client import HeliosSession
 from generator import voters as voters_gen
 from generator import votes as votes_gen
@@ -183,3 +196,23 @@ def _await_voters(uuid, expected, timeout_s, poll_s, log):
 def build_face(face_cfg):
   """ballot_face.yaml entry -> Helios question dicts."""
   return votes_gen.build_questions(face_cfg)
+
+
+def freeze(*, base_url, election_uuid, log=print):
+  """Freeze the election over HTTP. Opens voting."""
+  s = HeliosSession(base_url).login_devlogin()
+  s.post(f'/helios/elections/{election_uuid}/freeze', data={})
+
+  import helios_env
+  helios_env.setup_django()
+  from helios.models import Election
+  e = Election.objects.get(uuid=election_uuid)
+  if not e.frozen_at:
+    raise RuntimeError(
+      'freeze did not take. Helios refuses to freeze while issues_before_freeze is '
+      'non-empty — typically no questions, no trustee, or no voters.')
+  log(f'frozen at {e.frozen_at} — voting is open')
+  return e.frozen_at
+
+
+# log as console.detail formatter
