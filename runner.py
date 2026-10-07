@@ -141,14 +141,14 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
 
   log = console.detail
 
-  # Stage 0 - see stage0_configure.py
+  # Stage 0 - see stage0_setup.py
   # See console.py (using a Stage object for pipeline wall-clock)
   # with... as syntax triggers __enter__
   with console.Stage('STAGE 0 · CONFIGURE') as stg_zero:
-    from drivers import stage0_configure
+    from drivers import stage0_setup
     console.step(f'creating election, uploading {N} voters')
-    # Election uuid found via short name function in stage0_configure
-    election_uuid = stage0_configure.configure( # Note: uuid creation upon the following configure
+    # Election uuid found via short name function in stage0_setup
+    election_uuid = stage0_setup.configure( # Note: uuid creation upon the following configure
       base_url=base_url, short_name=short_name,
       name=f'Workload {arm} N={N} rep={rep}',
       questions=questions, n_voters=N, scheme=scheme, ablation=ablation,
@@ -162,7 +162,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
       'n_questions': len(questions), 'n_answers': n_answers})
 
   # Stage 1 - freeze election
-  from drivers import stage1_freeze
+  from drivers import stage0_setup
   with console.Stage('STAGE 1 · FREEZE') as st:
     # Key generation is NOT sampled here any more. keygen_time_ns and
     # prove_sk_time_ns are recorded by Helios inside Election.generate_trustee
@@ -174,7 +174,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
 
     console.step('freezing election (locks ballot + roll, opens voting)')
     t0 = time.perf_counter()
-    stage1_freeze.freeze(base_url=base_url, election_uuid=election_uuid, log=log)
+    stage0_setup.freeze(base_url=base_url, election_uuid=election_uuid, log=log)
     stage_wall('freeze', 'stage 1 freeze', time.perf_counter() - t0)
 
     # What every voter's browser downloads before it can render a ballot. The
@@ -198,7 +198,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
     f'{emitter.run_id}-ballots-n{N}-r{rep}.jsonl') # Separate jsonl for the ballots
   
   with console.Stage('STAGE 2 · ENCRYPTION (browser) + CAST') as st:
-    from drivers import stage2_encryption
+    from drivers import stage1_encrypt, stage2_cast
     from generator import voters as voters_gen
 
     ballots = votes_gen.generate_ballots(seed, questions, N)
@@ -209,7 +209,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
 
     enc_cfg = cfg.get('encryption', {})
     t0 = time.perf_counter()
-    samples, warmup_timings, table_build = stage2_encryption.sample_encryptions(
+    samples, warmup_timings, table_build = stage1_encrypt.sample_encryptions(
       base_url=base_url, election_uuid=election_uuid, ballots=ballots,
       scheme=scheme, djn41_mode=ablation.get('paillier_djn41_mode'),
       out_path=out_path, headless=headless,
@@ -263,9 +263,9 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
 
     console.step(f'casting {N} ballots through the real HTTP flow')
     t0 = time.perf_counter()
-    n_cast, payloads = stage2_encryption.cast_ballots(
+    n_cast, payloads = stage2_cast.cast_ballots(
       base_url=base_url, election_uuid=election_uuid,
-      encrypted=stage2_encryption.load_encrypted(out_path),
+      encrypted=stage1_encrypt.load_encrypted(out_path),
       credentials=credentials, total=N, log=log)
     stage_wall('encrypt', 'stage 2 cast', time.perf_counter() - t0)
 
@@ -279,7 +279,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
     console.detail('Helios refuses to tally while any vote is unverified, so '
                     'Stage 3 cannot start until this drains')
     t0 = time.perf_counter()
-    stage2_encryption.await_verification(election_uuid, n_cast, log=log)
+    stage2_cast.await_verification(election_uuid, n_cast, log=log)
     stage_wall('encrypt', 'stage 2 verify', time.perf_counter() - t0)
 
   # ---- STAGES 3+4 · THE REAL FLOW, INSTRUMENTED -----------------------------
