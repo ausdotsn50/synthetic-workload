@@ -98,7 +98,7 @@ def _election_hash(election_uuid):
   return Election.objects.get(uuid=election_uuid).hash
 
 # Await verification formatted derived from Election object
-def await_verification(election_uuid, expected, stall_s=120, poll_s=2.0,
+def await_verification(election_uuid, expected, stall_s=900, poll_s=2.0,
                        log=print):
   """
   Cast ballots are verified by a Celery task (tasks.cast_vote_verify_and_store), so
@@ -111,6 +111,10 @@ def await_verification(election_uuid, expected, stall_s=120, poll_s=2.0,
   guess about throughput, and the previous flat 1800s went under-budget somewhere
   around N=4000 — aborting runs that were draining normally and blaming the worker.
   A healthy queue moves every poll; only a genuinely stuck one goes quiet.
+
+  stall_s must exceed the slowest single ballot's verification, since nothing
+  moves while one is in progress. Paillier on the nle2025 face is ~100-135 s per
+  ballot, past the former 120 s.
   """
   import helios_env
   helios_env.setup_django()

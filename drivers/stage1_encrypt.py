@@ -21,6 +21,13 @@ import json
 import console
 import schemes
 
+# Longest one execute_script may run. Each call encrypts one whole question in
+# the booth, and Selenium's default (30 s) is less than Paillier needs on the
+# nle2025 face: 66 and 156 answers at ~1.2 s each on a 2026-10-07 laptop run.
+# Timing is taken in the page with performance.now(), so this only decides when
+# the harness gives up -- it never enters a measurement.
+SCRIPT_TIMEOUT_S = 1800
+
 # Headless webdriver
 def _driver(headless=True):
   from selenium import webdriver
@@ -33,7 +40,9 @@ def _driver(headless=True):
     opts.add_argument('--headless=new')
   opts.add_argument('--no-sandbox')
   opts.add_argument('--disable-dev-shm-usage')
-  return webdriver.Chrome(options=opts)
+  driver = webdriver.Chrome(options=opts)
+  driver.set_script_timeout(SCRIPT_TIMEOUT_S)
+  return driver
 
 # Usage of performance.now() as a lighweight function for benchmarking
 # Other alternatives like performance.measure() are ok as well but has more overhead and more recommended for multi-step workflows
