@@ -42,6 +42,11 @@ def _driver(headless=True):
   opts.add_argument('--disable-dev-shm-usage')
   driver = webdriver.Chrome(options=opts)
   driver.set_script_timeout(SCRIPT_TIMEOUT_S)
+  # Selenium's own HTTP client to chromedriver gives up separately, after 120 s
+  # (hard-coded in ChromiumRemoteConnection), so it needs the same allowance.
+  # Set just above the script timeout, so a runaway script still fails with the
+  # browser's own script-timeout error first.
+  driver.command_executor.client_config.timeout = SCRIPT_TIMEOUT_S + 60
   return driver
 
 # Usage of performance.now() as a lighweight function for benchmarking
