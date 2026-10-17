@@ -1,20 +1,31 @@
 """
-Stage 2 — encryption measurement AND board population, both in a real browser
+Stage 1 — ballot encryption in headless Chrome, with Helios's own booth code
 
-This module loads the booth page and drives the SAME `HELIOS.EncryptedAnswer`
-constructor via `driver.execute_script`, timing it with performance.now() in page
-context.
+Loads the booth page so HELIOS.* and jscrypto are in page context, parses the
+election there once, and drives the booth's own `HELIOS.EncryptedAnswer`
+constructor via `driver.execute_script`. Each encryption is timed with
+performance.now() inside the page; proof generation is timed on the same pass
+by a probe wrapped around the scheme's own generateDisjunctiveProof.
+
+The same code drives every arm: the booth dispatches on the election's key, and
+the harness only tells the probe which scheme's prototype to wrap.
+
+Encrypted ballots are streamed to a JSONL file as they are produced;
+load_encrypted reads them back for Stage 2 to cast.
 """
 
 import json
-import math
-import statistics
-import time
-from urllib.parse import urlencode
 
 import console
 
-# Headless webdriver 
+# Longest one execute_script may run. Each call encrypts one whole question in
+# the booth, and Selenium's default (30 s) is less than Paillier needs on the
+# nle2025 face: 66 and 156 answers at ~1.2 s each on a 2026-10-07 laptop run.
+# Timing is taken in the page with performance.now(), so this only decides when
+# the harness gives up -- it never enters a measurement.
+SCRIPT_TIMEOUT_S = 1800
+
+# Headless webdriver
 def _driver(headless=True):
   from selenium import webdriver
   from selenium.webdriver.chrome.options import Options
@@ -26,7 +37,14 @@ def _driver(headless=True):
     opts.add_argument('--headless=new')
   opts.add_argument('--no-sandbox')
   opts.add_argument('--disable-dev-shm-usage')
-  return webdriver.Chrome(options=opts)
+  driver = webdriver.Chrome(options=opts)
+  driver.set_script_timeout(SCRIPT_TIMEOUT_S)
+  # Selenium's own HTTP client to chromedriver gives up separately, after 120 s
+  # (hard-coded in ChromiumRemoteConnection), so it needs the same allowance.
+  # Set just above the script timeout, so a runaway script still fails with the
+  # browser's own script-timeout error first.
+  driver.command_executor.client_config.timeout = SCRIPT_TIMEOUT_S + 60
+  return driver
 
 # Usage of performance.now() as a lighweight function for benchmarking
 # Other alternatives like performance.measure() are ok as well but has more overhead and more recommended for multi-step workflows
@@ -43,12 +61,14 @@ return window.__workload_election.questions.length;
 
 # ZKP timing probe.
 #
-# Every proof in a ballot is produced by one function:
-# ElGamal.Ciphertext.prototype.generateDisjunctiveProof (elgamal.js:245).
+# Every proof in a ballot is produced by one function per scheme:
+# ElGamal.Ciphertext.prototype.generateDisjunctiveProof (elgamal.js:245) or
+# Paillier.Ciphertext.prototype.generateDisjunctiveProof (paillier.js:375).
 # doEncryption calls it once per answer slot for the individual proofs
-# (helios.js:280) and once more per question for the overall proof
-# (helios.js:307), so wrapping it captures all ballot proof generation and
-# nothing else.
+# (helios.js:270) and once more per question for the overall proof
+# (helios.js:298), so wrapping the scheme's own one captures all ballot proof
+# generation and nothing else. The scheme is passed in rather than guessed: the
+# booth loads both libraries, and wrapping the other one would record nothing.
 #
 # The wrapper calls the original through .apply and returns its value untouched.
 # Helios's own loop still drives the work, the proof that goes into the cast
@@ -57,22 +77,39 @@ return window.__workload_election.questions.length;
 # models.py times self.vote.verify inside it.
 #
 # What falls on the non-proof side is everything doEncryption does around these
-# calls: generate_plaintexts, the ElGamal.encrypt per slot, the hom_sum/rand_sum
-# loops, array construction. The hom_sum loop exists only to feed the overall
-# proof, but it is not proof generation, and moving it across the line would
-# mean judging Helios's code instead of timing it.
+# calls: generate_plaintexts, pk.encrypt per slot, the hom_sum/rand_sum loops,
+# array construction. The hom_sum loop exists only to feed the overall proof,
+# but it is not proof generation, and moving it across the line would mean
+# judging Helios's code instead of timing it.
 _INSTALL_ZKP_PROBE_JS = r"""
-const proto = (typeof ElGamal !== 'undefined' && ElGamal.Ciphertext)
-    ? ElGamal.Ciphertext.prototype : null;
+const [scheme] = arguments;
+const libName = scheme === 'paillier' ? 'Paillier' : 'ElGamal';
+const lib = scheme === 'paillier'
+    ? (typeof Paillier !== 'undefined' ? Paillier : null)
+    : (typeof ElGamal !== 'undefined' ? ElGamal : null);
+const target = libName + '.Ciphertext.prototype';
+const proto = (lib && lib.Ciphertext) ? lib.Ciphertext.prototype : null;
 if (!proto) {
-  throw new Error('ElGamal.Ciphertext.prototype is not reachable on the booth '
-                  + 'page, so there is nothing to wrap and encryption proof '
-                  + 'time cannot be measured');
+  throw new Error(target + ' is not reachable on the booth page, so there is '
+                  + 'nothing to wrap and encryption proof time cannot be '
+                  + 'measured');
+}
+
+// The key the booth parsed must belong to the same scheme: its ciphertexts are
+// the ones whose prototype is wrapped. A key of the other scheme would encrypt
+// through the other prototype and never reach the wrapper.
+const election = window.__workload_election;
+const pk = election ? election.public_key : null;
+if (!(lib.PublicKey && pk instanceof lib.PublicKey)) {
+  throw new Error('the election key parsed on the booth page is not '
+                  + (libName === 'ElGamal' ? 'an ' : 'a ') + libName
+                  + '.PublicKey, so its encryptions would never reach '
+                  + target + '.generateDisjunctiveProof');
 }
 
 const current = proto.generateDisjunctiveProof;
 if (typeof current !== 'function') {
-  throw new Error('ElGamal.Ciphertext.prototype.generateDisjunctiveProof is '
+  throw new Error(target + '.generateDisjunctiveProof is '
                   + (typeof current) + ', not a function — this booth build has '
                   + 'moved the proof entry point, and installing the probe '
                   + 'anyway would silently measure nothing');
@@ -81,10 +118,14 @@ if (typeof current !== 'function') {
 // Idempotent. A second install would nest one wrapper inside the other and
 // bill every proof twice.
 if (window.__workload_zkp) {
-  return {installed: true, already_installed: true};
+  if (window.__workload_zkp.target !== target) {
+    throw new Error('the ZKP probe is already installed on '
+                    + window.__workload_zkp.target + ', not ' + target);
+  }
+  return {installed: true, already_installed: true, target: target};
 }
 
-const acc = {ms: 0.0, calls: 0};
+const acc = {ms: 0.0, calls: 0, target: target};
 window.__workload_zkp = acc;
 proto.generateDisjunctiveProof = function() {
   const s = performance.now();
@@ -93,7 +134,7 @@ proto.generateDisjunctiveProof = function() {
   acc.calls += 1;
   return out;
 };
-return {installed: true, already_installed: false};
+return {installed: true, already_installed: false, target: target};
 """
 
 # See the ff. class in helios.js >> HELIOS.EncryptedAnswer = Class.extend({...})
@@ -123,7 +164,8 @@ const ea = new HELIOS.EncryptedAnswer(
     election.questions[qNum], answerIndexes, election.public_key);
 const t1 = performance.now();
 
-// Read immediately, before anything else on this page can call into ElGamal.
+// Read immediately, before anything else on this page can call into the
+// cryptosystem.
 const proof_ms = zkp.ms;
 const proof_calls = zkp.calls;
 
@@ -146,8 +188,9 @@ return {
 };
 """
 
-def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
-                       headless=True, warmup=1, log=print):
+def sample_encryptions(*, base_url, election_uuid, ballots, scheme,
+                       out_path=None, headless=True, warmup=1,
+                       log=print):
   """
   Encrypt `ballots` in a real browser, one record per ballot.
 
@@ -159,8 +202,9 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
   actually runs, not a harness-side re-creation of its parts.
 
   proof_ms is the part of timing_ms spent inside Helios's own
-  generateDisjunctiveProof, measured on the same single pass by the probe
-  installed below. Every ballot carries it; there is no second pass to sample.
+  generateDisjunctiveProof -- `scheme`'s own, ElGamal's or Paillier's --
+  measured on the same single pass by the probe installed below. Every ballot
+  carries it; there is no second pass to sample.
 
   `warmup` ballots are encrypted and discarded before measurement begins: the
   first ballots of a cell read high against steady state (997/1100/843 ms vs
@@ -206,9 +250,9 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
 
     # Before any encryption, warm-up included: the probe throws rather than
     # no-opping if the proof entry point is not where it should be.
-    driver.execute_script(_INSTALL_ZKP_PROBE_JS)
-    log('ZKP probe installed on '
-        'ElGamal.Ciphertext.prototype.generateDisjunctiveProof')
+    probe = driver.execute_script(_INSTALL_ZKP_PROBE_JS, scheme)
+    target = probe['target']
+    log(f'ZKP probe installed on {target}.generateDisjunctiveProof')
 
     """
     Visualization for ballots/ballot
@@ -263,8 +307,9 @@ def sample_encryptions(*, base_url, election_uuid, ballots, out_path=None,
         if not r['proof_calls']:
           raise RuntimeError(
             f'ZKP probe recorded no calls while encrypting question {q_num} of '
-            f'ballot {i}. generateDisjunctiveProof was wrapped but never ran, '
-            f'so encryption_proof_ms cannot be measured for this run.')
+            f'ballot {i}. {target}.generateDisjunctiveProof was wrapped but '
+            f'never ran, so encryption_proof_ms cannot be measured for this '
+            f'run.')
 
         total['timing_ms'] += r['timing_ms']
         total['proof_ms'] += r['proof_ms']
@@ -300,157 +345,3 @@ def load_encrypted(path):
     for line in f:
       if line.strip():
         yield json.loads(line) # Usage of yield generator -- one line at a time
-
-
-def cast_ballots(*, base_url, election_uuid, encrypted, credentials, total=None,
-                 log=print):
-  """
-  Cast each encrypted ballot through Helios's real flow:
-
-      password_voter_login -> POST /cast -> POST /cast_confirm
-
-  One fresh session per voter, because Helios keys the pending ballot to the
-  session (views.one_election_cast stores it via save_in_session_across_logouts,
-  and cast_confirm reads it back).
-
-  `encrypted` may be a list or the generator from load_encrypted; `total` is the
-  expected count, needed for the progress bar when a generator hides len().
-
-  Returns (number successfully cast, per-ballot payload sizes).
-  """
-  from drivers.http_client import HeliosSession
-
-  election_hash = _election_hash(election_uuid)
-
-  n = total if total is not None else len(encrypted)
-  if len(credentials) < n:
-    raise RuntimeError(
-      f'{n} ballots but only {len(credentials)} voter credentials — '
-      f'Stage 0 registered fewer voters than N')
-
-  cast = 0
-  payloads = []
-  prog = console.Progress(n, 'ballots cast', every=max(1, min(n // 10, 25)))
-  for i, item in enumerate(encrypted):
-    login_id, password, _voter_uuid = credentials[i] # From fetched credentials
-
-    vote = {'answers': item['encrypted_answers'],
-            'election_hash': election_hash,
-            'election_uuid': election_uuid}
-
-    # What actually crosses the wire, which ciphertext_bytes + proof_bytes does
-    # not describe: those count cryptographic content only, omitting the JSON
-    # structure, the election_hash/uuid wrapper fields, and form-encoding
-    # expansion. The storage projection based on them understates the board.
-    # Compact separators, matching the booth's JSON.stringify: without them
-    # json.dumps adds a space after every ',' and ':'.
-    body = json.dumps(vote, separators=(',', ':'))
-    payloads.append({
-      'json_bytes': len(body.encode('utf-8')),
-      'payload_bytes': len(urlencode({'encrypted_vote': body}).encode('utf-8')),
-    })
-
-    s = HeliosSession(base_url)
-    s.login_voter(election_uuid, login_id, password) # Voter login
-
-    # POST /cast does not check_csrf — one_election_cast only stashes the ballot
-    # via save_in_session_across_logouts and redirects. requests follows that
-    # redirect, so `r` is already the cast_confirm page, which renders the
-    # csrf_token field. Reading it from there is exactly what a browser does.
-    r = s.post(f'/helios/elections/{election_uuid}/cast',
-               data={'encrypted_vote': body}, csrf=False)
-    if not s.learn_csrf(r): # /cast_confirm contains csrf check for that (currently r)
-      raise RuntimeError(
-        f'no csrf_token on the cast_confirm page for voter {login_id}. '
-        f'Landed on {r.url} — if that is not .../cast_confirm the ballot was '
-        f'rejected before confirmation.')
-
-    # cast_confirm DOES check_csrf (views.py:902): this is the one POST in the
-    # cast flow that needs the token.
-    s.post(f'/helios/elections/{election_uuid}/cast_confirm',
-           data={'status_update': ''})
-    cast += 1
-    prog.tick(cast)
-
-  prog.done()
-  return cast, payloads
-
-
-def _election_hash(election_uuid):
-  import helios_env
-  helios_env.setup_django()
-  from helios.models import Election
-  return Election.objects.get(uuid=election_uuid).hash
-
-# Await verification formatted derived from Election object
-def await_verification(election_uuid, expected, stall_s=120, poll_s=2.0,
-                       log=print):
-  """
-  Cast ballots are verified by a Celery task (tasks.cast_vote_verify_and_store), so
-  a ballot is not tallyable the instant the POST returns. Helios itself refuses to
-  compute a tally while any vote is unverified — so Stage 3 cannot start until this
-  drains.
-
-  Waits on *lack of progress*, not on total elapsed time. The drain is linear in N
-  (measured: ~0.52 s/ballot at --concurrency 1), so any fixed deadline is really a
-  guess about throughput, and the previous flat 1800s went under-budget somewhere
-  around N=4000 — aborting runs that were draining normally and blaming the worker.
-  A healthy queue moves every poll; only a genuinely stuck one goes quiet.
-  """
-  import helios_env
-  helios_env.setup_django()
-  from helios.models import Election
-
-  t0 = time.time()
-  last_progress = t0
-  last = None
-  while True:
-    e = Election.objects.get(uuid=election_uuid)
-    pending = e.num_pending_votes
-    cast = e.voter_set.exclude(vote=None).count()
-    if pending == 0 and cast >= expected:
-      log(f'{cast}/{expected} verified in {time.time() - t0:.1f}s')
-      return cast
-
-    state = (pending, cast)
-    if state != last: # Different from last printed
-      log(f'celery: {cast}/{expected} verified, {pending} pending '
-          f'({time.time() - t0:.0f}s elapsed)')
-      last = state
-      last_progress = time.time()
-    elif time.time() - last_progress >= stall_s:
-      raise TimeoutError(_stall_diagnosis(e, expected, cast, pending, stall_s))
-
-    time.sleep(poll_s)
-
-
-def _stall_diagnosis(election, expected, cast, pending, stall_s):
-  """
-  A stalled drain has two very different causes and they need different fixes.
-
-  `cast` counts voters whose vote was stored, and store_vote only runs when
-  verification SUCCEEDS. A ballot that fails verification gets invalidated_at set,
-  which drops it out of num_pending_votes without ever reaching voter.vote — so
-  `pending == 0 and cast >= expected` becomes unsatisfiable and the wait can never
-  exit on its own. Quarantined ballots are excluded from the pending count for the
-  same reason. Reporting either as "is a worker running?" sends you after the wrong
-  thing entirely.
-  """
-  from helios.models import CastVote
-
-  votes = CastVote.objects.filter(voter__election=election)
-  invalidated = votes.exclude(invalidated_at=None).count()
-  quarantined = votes.filter(quarantined_p=True).count()
-
-  head = (f'ballot verification stalled: {cast}/{expected} verified, '
-          f'{pending} pending, no change for {stall_s}s.')
-
-  if invalidated or quarantined:
-    return (f'{head} {invalidated} ballot(s) failed verification and '
-            f'{quarantined} are quarantined; neither ever reaches voter.vote, so '
-            f'this run cannot reach {expected} verified. The board is incomplete '
-            f'— this cell should be discarded, not resumed.')
-
-  return (f'{head} No ballot has failed verification, so the queue simply is not '
-          f'draining: check that a Celery worker is running and consuming the '
-          f'"celery" queue.')

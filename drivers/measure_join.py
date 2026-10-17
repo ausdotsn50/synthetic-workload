@@ -1,8 +1,9 @@
 """
 Join Helios's instrumentation sidecar onto a measurement cell.
 
-Helios (branch measure/instrumentation) appends one JSON object per line to
-HELIOS_MEASURE_PATH as it executes. The file is shared across runs and across
+Helios (helios/measure.py -- on master, and merged into paillier-helios, which
+the server runs) appends one JSON object per line to HELIOS_MEASURE_PATH as it
+executes. The file is shared across runs and across
 processes -- the web process and the Celery worker are long-lived and read the
 path once at startup, so it cannot be run-scoped. Records are keyed by election
 uuid instead, and one cell is one election, so the join is exact.
@@ -34,6 +35,9 @@ STAGE_OF = {
   'decryption_proofs_bytes': 'decrypt',
   'dlog_precompute_time_ns': 'decrypt',
   'dlog_lookup_time_ns': 'decrypt',
+  # Paillier's counterpart of dlog_lookup_time_ns: the same per-cell loop in
+  # Tally.decrypt_from_factors, with an identity decode.
+  'decryption_time_ns': 'decrypt',
 }
 
 # Which Helios process records each metric. Not inferred from pid -- this is a
@@ -49,6 +53,7 @@ PROCESS_OF = {
   'prove_sk_time_ns': 'Helios web',
   'dlog_precompute_time_ns': 'Helios web',
   'dlog_lookup_time_ns': 'Helios web',
+  'decryption_time_ns': 'Helios web',     # inside the combine_decryptions request
   'aggregation_time_ns': 'Celery worker',
   'aggregation_only_ns': 'Celery worker',
   'decryption_factor_time_ns': 'Celery worker',
@@ -66,14 +71,17 @@ PAYLOAD_METRICS = {'decryption_factors_bytes', 'decryption_proofs_bytes'}
 # Sidecar metrics the harness reads but does not emit. Empty for now.
 SKIP_EMIT = set()
 
-# What a correctly instrumented ElGamal cell must contain. Missing any of these
-# means the branch is not checked out, HELIOS_MEASURE_PATH is unset on one of
-# the two processes, or a span was dropped in a merge.
+# What a correctly instrumented cell must contain, before acceptance.py
+# subtracts the scheme's forbidden set (schemes.forbidden_metrics): that drops
+# decryption_time_ns for ElGamal, and prove_sk_time_ns and the two dlog metrics
+# for Paillier. Missing any of the rest means the instrumentation is not on the
+# checkout, HELIOS_MEASURE_PATH is unset on one of the two processes, or a span
+# was dropped in a merge.
 REQUIRED_INSTRUMENTED = {
   'keygen_time_ns', 'prove_sk_time_ns', 'aggregation_time_ns',
   'aggregation_only_ns',
   'decryption_factor_time_ns', 'dlog_precompute_time_ns',
-  'dlog_lookup_time_ns',
+  'dlog_lookup_time_ns', 'decryption_time_ns',
   'decryption_factor_only_ns', 'verification_only_ns',
   'decryption_factors_bytes', 'decryption_proofs_bytes',
 }

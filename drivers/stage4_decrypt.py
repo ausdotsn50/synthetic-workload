@@ -2,9 +2,9 @@
 Stage 4 — decryption, driven through Helios's own endpoints.
 
 This stage drives the phase and waits for its signal. It times nothing: the
-crypto is timed inside Helios (helios/measure.py, branch
-measure/instrumentation) and reaches the harness through the sidecar, joined on
-election uuid.
+crypto is timed inside Helios (helios/measure.py -- on master, and merged into
+paillier-helios, which the server runs) and reaches the harness through the
+sidecar, joined on election uuid.
 
 Two steps, reached differently:
 
@@ -21,6 +21,10 @@ DIRECTLY MEASURED rather than derived:
   decryption_factor_time_ns    alpha^x + Chaum-Pedersen proofs, in the worker
   dlog_precompute_time_ns      DLogTable.precompute -- Theta(N)
   dlog_lookup_time_ns          per-cell decrypt() + the O(1) lookups
+
+Under Paillier the factor loop is timed the same way, with Paillier's own
+factors and proofs, and the two dlog metrics are absent: decryption_time_ns
+times the same per-cell loop, whose decode is the identity.
 
 That structure is the point of the thesis: Helios walks g^0..g^N into a dict
 rather than using BSGS, so ElGamal's decryption grows linearly with the number
