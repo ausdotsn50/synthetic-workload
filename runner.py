@@ -1,15 +1,12 @@
 """
 Sample commands, one per measured arm:
 - uv run --project ../helios-server python runner.py --face smoke --n 10
-- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier --djn41-mode off
-- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier --djn41-mode short
-- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier --djn41-mode long
+- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier
 
-The arm is the scheme plus, under Paillier, its DJN §4.1 mode: elgamal,
-paillier-off, paillier-short, paillier-long. All four cast the same ballots at
+The arm is the scheme: elgamal, paillier-off. Both cast the same ballots at
 the same (N, rep) -- see generator/votes.py, cell_seed -- so arms compare
-pairwise. --djn41-mode and --crt-proofs default to the `paillier:` block in
-config/levels.yaml ('off' and CRT on, the server's own defaults).
+pairwise. --crt-proofs defaults to the `paillier:` block in
+config/levels.yaml (CRT on, the server's own default).
 
 Execution is SERIAL by design (§3.8). At ~6.5 s of pure computation per ballot,
 concurrency on this machine would saturate CPU immediately and the numbers would
@@ -32,43 +29,36 @@ import preflight
 import schemes
 from emit import Emitter, make_run_id
 
-DJN41_MODES = ('off', 'short', 'long')
-
 # ElectionForm.short_name is a SlugField(max_length=40); a longer name is
 # refused by the form, and the election is never created.
 SHORT_NAME_MAX = 40
 
 
-def resolve_ablation(scheme, cfg, djn41_mode=None, crt_proofs=None):
+def resolve_ablation(scheme, cfg, crt_proofs=None):
   """
   The configuration a cell runs under, in Election.ablation_config's shape:
-  {} under ElGamal, {'paillier_djn41_mode', 'paillier_use_crt_proofs'} under
+  {} under ElGamal, {'paillier_use_crt_proofs'} under
   Paillier. A flag given on the command line wins over the `paillier:` block
   in config/levels.yaml. Raises ValueError on a flag the scheme cannot take.
   """
   if scheme != 'paillier':
-    if djn41_mode is not None or crt_proofs is not None:
-      raise ValueError(f'--djn41-mode and --crt-proofs apply only to '
+    if crt_proofs is not None:
+      raise ValueError(f'--crt-proofs applies only to '
                        f'--scheme paillier, and this cell is {scheme!r}')
     return {}
 
   p = cfg.get('paillier') or {}
-  mode = djn41_mode if djn41_mode is not None else p.get('djn41_mode', 'off')
-  if mode not in DJN41_MODES:
-    raise ValueError(
-      f'paillier djn41_mode is {mode!r}, not one of {DJN41_MODES}. In YAML a '
-      f"bare off is the boolean false: write it quoted, 'off'.")
   crt = ((crt_proofs == 'on') if crt_proofs is not None
          else p.get('crt_proofs', True))
   if not isinstance(crt, bool):
     raise ValueError(f'paillier crt_proofs is {crt!r}, not true or false')
-  return {'paillier_djn41_mode': mode, 'paillier_use_crt_proofs': crt}
+  return {'paillier_use_crt_proofs': crt}
 
 
 def arm_label(scheme, ablation):
-  """elgamal, or paillier-<djn41 mode>: the four measured arms."""
+  """elgamal, or paillier-off: the two measured arms."""
   if scheme == 'paillier':
-    return f"paillier-{ablation['paillier_djn41_mode']}"
+    return 'paillier-off'
   return scheme
 
 
@@ -209,23 +199,12 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
 
     enc_cfg = cfg.get('encryption', {})
     t0 = time.perf_counter()
-    samples, warmup_timings, table_build = stage1_encrypt.sample_encryptions(
+    samples, warmup_timings = stage1_encrypt.sample_encryptions(
       base_url=base_url, election_uuid=election_uuid, ballots=ballots,
-      scheme=scheme, djn41_mode=ablation.get('paillier_djn41_mode'),
+      scheme=scheme,
       out_path=out_path, headless=headless,
       warmup=enc_cfg.get('warmup_ballots', 1), log=log)
     stage_wall('encrypt', 'stage 2 encrypt', time.perf_counter() - t0)
-
-    # Paillier 'short' and 'long' only: the booth's one-time DJN §4.1
-    # fixed-base table build, timed on its own before the warm-up. Once per
-    # cell, because the booth builds the tables once per page load.
-    if table_build is not None:
-      em('encrypt', 'djn41_table_build_ms', table_build['build_ms'], 'ms',
-         {'tier': 'operation', 'source': 'browser',
-          'hn_table_len': table_build['hn_len'],
-          'h_table_len': table_build['h_len'],
-          'note': 'built once per booth page load, so in real use once per '
-                  'voter, before their ballot; encryption_time_ms excludes it'})
 
     # Discarded warm-up ballots: kept in the record, excluded from analysis.
     for i, t in enumerate(warmup_timings):
@@ -397,9 +376,6 @@ def main(argv=None):
   p = argparse.ArgumentParser(description='Run one workload cell (spec PART 3)')
   p.add_argument('--scheme', default=None, help='default: first in levels.yaml')
   # Paillier only. Unset means the `paillier:` block in levels.yaml.
-  p.add_argument('--djn41-mode', choices=DJN41_MODES, default=None,
-                 help="Paillier encryption function: 'off' (standard), or DJN "
-                      "§4.1 'short' or 'long'; default from levels.yaml")
   p.add_argument('--crt-proofs', choices=('on', 'off'), default=None,
                  help='Paillier CRT decryption proofs; default from levels.yaml')
   p.add_argument('--n', type=int, default=None, help='default: first level')
@@ -440,7 +416,7 @@ def main(argv=None):
   # short_name the form would refuse, stops the cell here rather than halfway.
   # The run id's suffix is always 4 characters, so a placeholder sizes the name.
   try:
-    ablation = resolve_ablation(scheme, cfg, djn41_mode=args.djn41_mode,
+    ablation = resolve_ablation(scheme, cfg,
                                 crt_proofs=args.crt_proofs)
     short_name_for(arm_label(scheme, ablation), N, args.rep, 'xxxx')
   except ValueError as e:

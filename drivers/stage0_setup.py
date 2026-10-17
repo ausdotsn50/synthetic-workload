@@ -2,7 +2,7 @@
 Stage 0 — election setup, driven through Helios's own HTTP API
 
 Creates the election in the requested arm (the scheme and, under Paillier, the
-DJN §4.1 mode and CRT-proof flag) and confirms from the database that both the
+CRT-proof flag) and confirms from the database that both the
 election row and the trustee key are that arm. Then saves the ballot face,
 uploads the voter list, and freezes the election.
 
@@ -37,7 +37,7 @@ def configure(*, base_url, short_name, name, questions, n_voters, scheme,
 
   `scheme` is the cryptosystem, 'elgamal' or 'paillier'. `ablation` is the
   Paillier configuration in Election.ablation_config's shape: {} for ElGamal,
-  {'paillier_djn41_mode': ..., 'paillier_use_crt_proofs': ...} for Paillier.
+  {'paillier_use_crt_proofs': ...} for Paillier.
   """
   s = HeliosSession(base_url).login_devlogin()
 
@@ -58,10 +58,8 @@ def configure(*, base_url, short_name, name, questions, n_voters, scheme,
     'crypto_scheme': scheme,
   }
   if scheme == 'paillier':
-    # The mode is a three-way choice. The CRT flag is read from the raw post
-    # (helios/forms.py, _raw_flag), so it goes as '1' or '0'. The retired
-    # boolean paillier_use_djn41 is never posted: the form refuses it.
-    data['paillier_djn41_mode'] = ablation['paillier_djn41_mode']
+    # The CRT flag is read from the raw post
+    # (helios/forms.py, _raw_flag), so it goes as '1' or '0'.
     data['paillier_use_crt_proofs'] = (
       '1' if ablation['paillier_use_crt_proofs'] else '0')
 
@@ -111,10 +109,8 @@ def _check_arm(uuid, scheme, ablation, log):
   Read the new election back and fail fast unless it is the arm that was posted.
 
   A form that dropped or misread a field would otherwise run a whole cell under
-  the wrong configuration -- the failure the retired paillier_use_djn41 flag
-  once produced, when '0' parsed as True. Checked on the election row AND on
-  the key the trustee actually generated: a Paillier key carries its own mode,
-  and a standard ('off') key carries no h or hn.
+  the wrong configuration. Checked on the election row AND on
+  the key the trustee actually generated.
   """
   import helios_env
   helios_env.setup_django()
@@ -132,14 +128,7 @@ def _check_arm(uuid, scheme, ablation, log):
   if pk is None:
     problems.append('no Helios trustee key was generated')
   elif scheme == 'paillier':
-    want = ablation['paillier_djn41_mode']
-    got = getattr(pk, 'djn41_mode', None)
-    if got != want:
-      problems.append(f'the trustee key is in djn41_mode {got!r}, requested '
-                      f'{want!r}')
-    if got == 'off' and (getattr(pk, 'h', None) is not None
-                         or getattr(pk, 'hn', None) is not None):
-      problems.append("the trustee key is 'off' but carries h/hn")
+    pass
   elif getattr(pk, 'y', None) is None:
     problems.append(f'the trustee key is not an ElGamal key: '
                     f'{type(pk).__name__}')

@@ -24,8 +24,8 @@ def cell_seed(base_seed, N, rep):
   Derive a per-cell seed deterministically. Hashing rather than arithmetic mixing
   so neighbouring cells do not get correlated streams.
 
-  Neither the scheme nor the Paillier mode is hashed in, so all four arms --
-  elgamal and paillier off/short/long -- at the same (N, rep) cast identical
+  The scheme is not hashed in, so both arms --
+  elgamal and paillier-off -- at the same (N, rep) cast identical
   ballots and must produce identical tallies. That makes the comparison between
   arms a paired one. The seed itself is recorded on every record, so any cell's
   ballots can still be regenerated exactly.

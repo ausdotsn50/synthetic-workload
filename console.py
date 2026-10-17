@@ -287,9 +287,6 @@ def summary(records, N):
   # Whole-phase rates: a projection asks how long each phase takes. Only work
   # that grows with the number of voters is projected.
   enc = _vals(records, 'encryption_time_ms', source='browser')
-  # DJN §4.1 'short'/'long' only: the booth builds its tables once per page
-  # load, which in real use is once per voter, so it is per-ballot work too.
-  tb = _vals(records, 'djn41_table_build_ms')
   agg = _vals(records, 'aggregation_time_ns')
   agg_per = agg[0] / _n_votes(records, N) if agg else None
   # The dlog precompute walks g^0..g^N: the one decryption step that grows with
@@ -310,7 +307,7 @@ def summary(records, N):
         if r['metric'] == 'cast_payload_bytes'
         and r.get('extra', {}).get('json_bytes')]
   stored = 2 * _median(js) if js else None
-  _projection(N, enc, tb[0] if tb else None, agg_per, per_entry, dec_fixed,
+  _projection(N, enc, agg_per, per_entry, dec_fixed,
               stored, stage_walls, has_dlog=_has_dlog(records))
 
 
@@ -333,14 +330,6 @@ def _crypto_ops(records, N):
     rows.append(('encryption, excl. proof', _ms(_median(enc)),
                  _note(records, 'encryption_time_ms', 'derived',
                        f'median of {len(enc)}')))
-
-  # Paillier DJN §4.1 'short'/'long': the booth's fixed-base tables, built
-  # once per page load and not part of any encryption above.
-  tb = _vals(records, 'djn41_table_build_ms')
-  if tb:
-    rows.append(('djn41_table_build_ms', _ms(tb[0]),
-                 _note(records, 'djn41_table_build_ms',
-                       'once per page load, not in encryption')))
 
   # Homomorphic addition alone, inside the aggregation loop.
   agg_only = _vals(records, 'aggregation_only_ns')
@@ -507,15 +496,14 @@ def _payload_timing(records, N):
     _row(label, value, note)
 
 
-def _projection(N, enc_samples, table_build_ms, agg_per_ns, dlog_per_entry_ns,
+def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns,
                 dec_fixed_ns, stored_bytes, stage_walls, has_dlog=True):
   """
   Extrapolate this cell's measured per-ballot rates to larger electorates.
 
   Only work that grows with the number of voters is projected, and linear
   extrapolation is defensible for exactly that: encryption is per-ballot
-  independent work (plus, under DJN §4.1 'short'/'long', the table build every
-  voter's booth pays once), aggregation is N modular multiplications, the dlog
+  independent work, aggregation is N modular multiplications, the dlog
   precompute is Theta(N) by construction (spec 0.1), and storage is N x the
   stored ballot. It is NOT defensible for anything involving memory pressure or
   database growth, which is why those are not projected.
@@ -534,8 +522,6 @@ def _projection(N, enc_samples, table_build_ms, agg_per_ns, dlog_per_entry_ns,
   _p()
 
   enc_ms = _mean(enc_samples) if enc_samples else None
-  if enc_ms and table_build_ms:
-    enc_ms += table_build_ms
   cast_per = None
   if stage_walls and N:
     # Cast (HTTP login+cast+cast_confirm) + Celery verification drain, per
@@ -564,9 +550,6 @@ def _projection(N, enc_samples, table_build_ms, agg_per_ns, dlog_per_entry_ns,
     per_8h = int(28800 / (enc_ms / 1000))
     detail(f'At {enc_ms:.0f} ms/ballot this machine encrypts ~{per_8h:,} ballots '
            f'in 8 h, ~{per_day:,} in 24 h.')
-  if enc_ms and table_build_ms:
-    detail(f'encrypt includes the DJN §4.1 table build, {_ms(table_build_ms)} per '
-           f'ballot: each voter\'s booth builds it once per page load.')
   if has_dlog:
     detail('decrypt is the dlog table precompute, the only decryption step that '
            'grows with N.')

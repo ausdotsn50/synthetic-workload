@@ -43,8 +43,7 @@ acceptance.py    Milestone 2 acceptance checks
 ## Stages
 
 Every stage drives Helios through the endpoints a real election uses, and the
-same drivers run all four arms (`elgamal`, `paillier-off`, `paillier-short`,
-`paillier-long`). Helios times its own operations from the inside
+same drivers run both arms (`elgamal`, `paillier-off`). Helios times its own operations from the inside
 (`helios/measure.py` in helios-server), appends them to the sidecar file at
 `HELIOS_MEASURE_PATH`, and `measure_join.py` joins them onto the cell by
 election uuid. The harness itself records stage wall clocks, in-browser
@@ -53,7 +52,7 @@ encryption timings and payload sizes.
 | Module | What it does | Runs in | Recorded there |
 |---|---|---|---|
 | `stage0_setup.py` | `configure`: create the election in the requested arm and confirm the election row and trustee key match it, save the ballot face, upload the voter list and wait for Celery to register it. `freeze`: lock the ballot and roll, open voting | Helios web process, over HTTP; voter-file processing in the Celery worker | Helios, at election creation: `keygen_time_ns`; `prove_sk_time_ns` (ElGamal only). Harness: walls `stage 0 configure` and `stage 1 freeze`; `election_json_bytes` (the booth's download, fetched after freeze) |
-| `stage1_encrypt.py` | encrypt each ballot with the booth's own `HELIOS.EncryptedAnswer`, after discarded warm-up ballot(s); stream the ciphertexts to `<run_id>-ballots-n<N>-r<rep>.jsonl` | headless Chrome (Selenium) | Harness, timed in the page with `performance.now()`: `encryption_time_ms`, `encryption_proof_ms`, `ciphertext_bytes`, `proof_bytes`, `encryption_warmup_ms`; `djn41_table_build_ms` (Paillier `short` and `long` only); wall `stage 2 encrypt` |
+| `stage1_encrypt.py` | encrypt each ballot with the booth's own `HELIOS.EncryptedAnswer`, after discarded warm-up ballot(s); stream the ciphertexts to `<run_id>-ballots-n<N>-r<rep>.jsonl` | headless Chrome (Selenium) | Harness, timed in the page with `performance.now()`: `encryption_time_ms`, `encryption_proof_ms`, `ciphertext_bytes`, `proof_bytes`, `encryption_warmup_ms`; wall `stage 2 encrypt` |
 | `stage2_cast.py` | cast each ballot as its voter (login → `/cast` → `/cast_confirm`), then wait until Celery has verified every ballot | web process + Celery worker | Harness: `cast_payload_bytes`; walls `stage 2 cast` and `stage 2 verify`. Helios, per ballot: `verification_time_ns`, `verification_only_ns` |
 | `stage3_aggregate.py` | `POST /compute_tally`, wait for `encrypted_tally` | Celery worker | Helios: `aggregation_time_ns`, `aggregation_only_ns`. Harness: wall `stage 3 aggregate` |
 | `stage4_decrypt.py` | wait for the decryption factors (a task chained off Stage 3's POST), then `POST /combine_decryptions` | Celery worker + web process | Helios: `decryption_factor_time_ns`, `decryption_factor_only_ns`, `decryption_factors_bytes`, `decryption_proofs_bytes`; then `dlog_precompute_time_ns` and `dlog_lookup_time_ns` (ElGamal) or `decryption_time_ns` (Paillier). Harness: `result` with the expected tally; wall `stage 4 decrypt` |

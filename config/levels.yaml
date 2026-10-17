@@ -1,20 +1,17 @@
 # Default values for level config
 #
-# Four measured arms, one command each (runner.py runs one cell; add --n/--rep):
+# Two measured arms, one command each (runner.py runs one cell; add --n/--rep):
 #   elgamal         python runner.py
-#   paillier-off    python runner.py --scheme paillier --djn41-mode off
-#   paillier-short  python runner.py --scheme paillier --djn41-mode short
-#   paillier-long   python runner.py --scheme paillier --djn41-mode long
+#   paillier-off    python runner.py --scheme paillier
 # each prefixed with `uv run --project ../helios-server`. At the same (N, rep)
-# all four cast identical ballots (generator/votes.py, cell_seed), so the arms
+# both cast identical ballots (generator/votes.py, cell_seed), so the arms
 # compare pairwise.
 schemes:
   - elgamal
 
-# Paillier defaults, used when --djn41-mode / --crt-proofs are not given. These
-# are the server's own defaults: standard Paillier, CRT decryption proofs on.
+# Paillier defaults, used when --crt-proofs is not given. This
+# is the server's own default: CRT decryption proofs on.
 paillier:
-  djn41_mode: 'off'   # QUOTED: a bare off is YAML's boolean false
   crt_proofs: true
 
 levels: # Electoral size/voter count

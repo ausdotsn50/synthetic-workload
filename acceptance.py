@@ -3,8 +3,7 @@ Milestone 2 acceptance test.
 
     uv run --project ../helios-server python acceptance.py results/<run_id>.jsonl [N]
 
-The same checks apply to all four arms (elgamal, paillier-off, paillier-short,
-paillier-long); which metrics are required or forbidden follows from the
+The same checks apply to both arms (elgamal, paillier-off); which metrics are required or forbidden follows from the
 scheme and the ablation the records claim, both checked against the election.
 
 Spec PART 5 defines Milestone 2 as done when "Stages 0-4 produce JSONL for N = 10".
@@ -166,38 +165,6 @@ def _observed_ablation(records):
     return None, f'database unreachable: {type(exc).__name__}: {exc}'
 
 
-def _observed_key_mode(records):
-  """
-  Read the DJN §4.1 mode off the election's public key itself.
-
-  One level below ablation_config: the row says what the election was set to
-  do, the key what the trustee actually generated. A 'short' key and a 'long'
-  key are otherwise identical, so the key carries its own mode, and a standard
-  key reads 'off'.
-
-  Returns (True, mode, evidence) -- mode None when the key has no DJN mode at
-  all, i.e. is not a Paillier key -- or (False, None, reason) when the key
-  cannot be read.
-  """
-  uuid = None
-  for r in records:
-    if r['metric'] == 'election_created':
-      uuid = r.get('extra', {}).get('election_uuid')
-  if not uuid:
-    return False, None, 'no election_uuid in the records'
-  try:
-    import helios_env
-    helios_env.setup_django()
-    from helios.models import Election
-    pk = Election.objects.get(uuid=uuid).public_key
-  except Exception as exc:
-    return False, None, f'database unreachable: {type(exc).__name__}: {exc}'
-  if pk is None:
-    return False, None, f'Election<{uuid}> has no public key'
-  return (True, getattr(pk, 'djn41_mode', None),
-          f'Election<{uuid}>.public_key ({type(pk).__name__})')
-
-
 def check(path, expected_n=10):
   c = Check()
   records, bad = load(path)
@@ -248,7 +215,7 @@ def check(path, expected_n=10):
 
   # --- the ablation the records CLAIM, against what the election DID -------
   # claimed_ablation also decides which metrics are required and forbidden
-  # below: DJN §4.1 'short' and 'long' add the booth's table build. It stays
+  # below. It stays
   # None when the records disagree or carry no stamp.
   claimed_ablation = None
   claimed_ablations = {json.dumps(r.get('extra', {}).get('ablation'), sort_keys=True)
@@ -283,19 +250,6 @@ def check(path, expected_n=10):
                f'run is mislabeled')
       else:
         c.ok('emitted ablation matches what the election did', why)
-
-      # ...and against the key the trustee generated, which carries its mode.
-      claimed_mode = claimed.get('paillier_djn41_mode')
-      if claimed_mode is not None:
-        name = 'election key is in the claimed DJN §4.1 mode'
-        reachable, key_mode, why = _observed_key_mode(records)
-        if not reachable:
-          c.warn('key-level DJN §4.1 corroboration unavailable', why)
-        elif key_mode != claimed_mode:
-          c.fail(name, f'records claim {claimed_mode!r} but {why} is in '
-                       f'{key_mode!r} — this run is mislabeled')
-        else:
-          c.ok(name, f'{why}: {key_mode!r}')
 
   # --- schema ------------------------------------------------------------
   stages = {r['stage'] for r in records}
@@ -703,7 +657,7 @@ def check(path, expected_n=10):
     c.ok('decrypted result present', f'per-question totals {totals}')
 
     # Exact, not merely plausible: the runner counts the cast plaintexts in the
-    # clear, and every arm casts the same ballots, so all four must match it.
+    # clear, and every arm casts the same ballots, so both must match it.
     expected_tally = (res[-1].get('extra') or {}).get('expected')
     name = 'decrypted result equals the tally of the cast ballots'
     if expected_tally is None:
