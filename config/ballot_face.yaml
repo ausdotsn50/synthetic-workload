@@ -16,7 +16,7 @@ nle2025:
       answer_prefix: Partylist
 
 smoke:
-  description: tiny face for plumbing checks only
+  description: small two-question ballot, 6 answer slots
   questions:
     - short_name: q1
       question: Pick up to 2

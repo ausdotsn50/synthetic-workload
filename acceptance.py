@@ -34,11 +34,11 @@ STAGE_WALLS = {'stage 0 configure', 'stage 1 freeze', 'stage 2 encrypt',
 # A prepared cell also populates N - S ballots after the live sample.
 PREPARED_STAGE_WALLS = STAGE_WALLS | {'stage 2 populate'}
 
-# Per-ballot metrics of the live sample alone, in every prepared cell.
+# Per-ballot metrics of the live sample alone, in every bulk cell.
 ENCRYPTION_METRICS = ('encryption_time_ms', 'encryption_proof_ms',
                       'ciphertext_bytes', 'proof_bytes')
-# Per-ballot metrics of whatever went through the real cast path: the sample
-# under insert, all N under cast.
+# Per-ballot metrics of whatever went through the real cast path: in a bulk
+# cell, the live sample only.
 CAST_METRICS = ('cast_payload_bytes', 'verification_time_ns',
                 'verification_only_ns')
 
@@ -202,9 +202,10 @@ def check(path, expected_n=10):
   c.ok('records agree on one scheme', scheme)
 
   # --- ...against the scheme the run PRODUCED (§8.1) ----------------------
-  # This is the check whose absence let `--scheme paillier --skip keygen` run a
-  # complete ElGamal election, stamp "paillier" on all ~71 records, and pass.
-  # A stamp is a claim; a ballot is evidence.
+  # This is the check whose absence once let a run labelled paillier (through
+  # a stage-skipping option since removed) execute a complete ElGamal
+  # election, stamp "paillier" on all ~71 records, and pass. A stamp is a
+  # claim; a ballot is evidence.
   ballot_scheme, ballot_why = _observed_from_ballots(path)
   db_scheme, db_why = _observed_from_db(records)
 
@@ -224,10 +225,6 @@ def check(path, expected_n=10):
         c.ok('emitted scheme matches what the run produced (§8.1)', why)
 
   # --- the ablation the records CLAIM, against what the election DID -------
-  # claimed_ablation also decides which metrics are required and forbidden
-  # below. It stays
-  # None when the records disagree or carry no stamp.
-  claimed_ablation = None
   claimed_ablations = {json.dumps(r.get('extra', {}).get('ablation'), sort_keys=True)
                        for r in records}
   if len(claimed_ablations) > 1:
@@ -235,7 +232,6 @@ def check(path, expected_n=10):
            f'found {len(claimed_ablations)} distinct configurations in one run')
   else:
     claimed = json.loads(claimed_ablations.pop())
-    claimed_ablation = claimed
 
     if claimed is None:
       if spec.key == 'paillier':
@@ -270,7 +266,7 @@ def check(path, expected_n=10):
     else 'missing: ' + ', '.join(sorted(missing)))
 
   metrics = {r['metric'] for r in records}
-  required = schemes.required_metrics(scheme, claimed_ablation)
+  required = schemes.required_metrics(scheme)
   missing_m = required - metrics
   (c.ok if not missing_m else c.fail)(
     f'all required metrics present (for {scheme})',
@@ -278,7 +274,7 @@ def check(path, expected_n=10):
 
   # Symmetric to the above, and just as load-bearing: a Paillier run emitting
   # dlog_lookup_time_ns is reporting a stage that does not exist.
-  forbidden = schemes.forbidden_metrics(scheme, claimed_ablation) & metrics
+  forbidden = schemes.forbidden_metrics(scheme) & metrics
   (c.ok if not forbidden else c.fail)(
     f'no metrics emitted that {scheme} cannot produce',
     '' if not forbidden
@@ -312,7 +308,7 @@ def check(path, expected_n=10):
            'process and the Celery worker.')
   else:
     required_i = (REQUIRED_INSTRUMENTED
-                  - schemes.forbidden_metrics(scheme, claimed_ablation))
+                  - schemes.forbidden_metrics(scheme))
     missing_i = required_i - {r['metric'] for r in instrumented}
     (c.ok if not missing_i else c.fail)(
       f'all instrumented metrics present (for {scheme})',
@@ -702,49 +698,74 @@ def check(path, expected_n=10):
     (c.ok if got == expected_n else c.fail)(
       f'N = {expected_n} ballots tallied', f'got {got}')
 
+  if created is not None:
+    _check_cell(c, records, created)
   if prepared:
     _check_prepared(c, records, created, scheme)
 
   return c.report()
 
 
-def _check_prepared(c, records, created, scheme):
-  """
-  The checks a prepared cell adds (§2.7). Live cells never reach here.
+def _ex(r):
+  return r.get('extra') or {}
 
-  The set's provenance is checked against the snapshot the runner recorded
-  before Stage 0, not against whatever the set directory holds now: a set
-  extended since this cell ran still describes this cell correctly.
+
+def _count(records, metric, **want):
+  return sum(1 for r in records if r['metric'] == metric
+             and all(_ex(r).get(k) == v for k, v in want.items()))
+
+
+def _check_cell(c, records, created):
+  """
+  What every cell, live or bulk, must show: it started on a fresh Celery
+  worker and nothing restarted the worker inside the election; the tables
+  were ANALYZEd before the tally; the worker's memory was read at the tally's
+  start and through Stages 3 and 4; and the result is the master list's.
   """
   import helios_env
-  from drivers import prepared_set as ps
   from generator import votes as votes_gen
 
-  ex = created.get('extra') or {}
+  ex = _ex(created)
   N = created['N']
-  S = ex.get('sample_size')
-  mode = ex.get('populate')
-  c.ok('prepared cell', f'S = {S} live, {N - (S or 0)} by {mode}')
 
-  def _ex(r):
-    return r.get('extra') or {}
+  # --- one fresh worker, at the start, and no restart after ----------------
+  restarts = [r for r in records if r['metric'] == 'worker_restarted']
+  at_start = [r for r in restarts if _ex(r).get('at') == 'cell_start']
+  if len(at_start) != 1:
+    c.fail('one fresh worker at cell start',
+           f'{len(at_start)} worker_restarted record(s) with at=cell_start')
+  elif _ex(at_start[0]).get('old_pid') == _ex(at_start[0]).get('new_pid'):
+    c.fail('one fresh worker at cell start',
+           f'pid {_ex(at_start[0]).get("old_pid")} before and after')
+  else:
+    c.ok('one fresh worker at cell start',
+         f'pid {_ex(at_start[0]).get("old_pid")} -> '
+         f'{_ex(at_start[0]).get("new_pid")}')
+  others = len(restarts) - len(at_start)
+  (c.ok if not others else c.fail)(
+    'no worker restart inside the election',
+    '' if not others else f'{others} other worker_restarted record(s)')
 
-  def count(metric, **want):
-    return sum(1 for r in records if r['metric'] == metric
-               and all(_ex(r).get(k) == v for k, v in want.items()))
-
-  snap_r = next((r for r in records if r['metric'] == 'prepared_set'), None)
-  if snap_r is None:
-    c.fail('prepared-set snapshot recorded', 'no prepared_set record')
-    return
-  snap = _ex(snap_r)
-  m = snap.get('manifest') or {}
+  # --- operational records ------------------------------------------------
+  (c.ok if _count(records, 'analyze') == 1 else c.fail)(
+    'analyze record present', f'{_count(records, "analyze")} record(s)')
+  peaks = {r['stage'] for r in records if r['metric'] == 'worker_peak_rss_bytes'
+           and r['value'] > 0}
+  (c.ok if peaks >= {'aggregate', 'decrypt'} else c.fail)(
+    'worker_peak_rss_bytes for Stage 3 and Stage 4',
+    ', '.join(f'{r["stage"]} {r["value"] / (1 << 20):.0f} MiB' for r in records
+              if r['metric'] == 'worker_peak_rss_bytes') or 'none')
+  start = [r for r in records if r['metric'] == 'worker_rss_at_tally_start_bytes']
+  ok = len(start) == 1 and (start[0]['value'] or 0) > 0
+  (c.ok if ok else c.fail)(
+    'one worker_rss_at_tally_start_bytes',
+    f'{start[0]["value"] / (1 << 20):.0f} MiB' if ok
+    else f'{len(start)} record(s)')
 
   # --- the tally: master[:N], counted again here, from config alone --------
   faces = helios_env.load_config('ballot_face.yaml')
   cfg = helios_env.load_config('levels.yaml')
-  face_key = ex.get('ballot_face')
-  questions = votes_gen.build_questions(faces[face_key])
+  questions = votes_gen.build_questions(faces[ex.get('ballot_face')])
   expected = votes_gen.expected_tally(
     questions, votes_gen.master_ballots(cfg['seed'], questions, N))
   res = next((r for r in reversed(records) if r['metric'] == 'result'), None)
@@ -758,6 +779,40 @@ def _check_prepared(c, records, created, scheme):
     c.fail(name, 'the runner recorded a different expected tally')
   else:
     c.ok(name, f'{expected}')
+
+
+def _check_prepared(c, records, created, scheme):
+  """
+  The checks a bulk cell adds (§2.7), after _check_cell. Live cells never
+  reach here.
+
+  The set's provenance is checked against the snapshot the runner recorded
+  before Stage 0, not against whatever the set directory holds now: a set
+  extended since this cell ran still describes this cell correctly.
+  """
+  import helios_env
+  from drivers import prepared_set as ps
+  from generator import votes as votes_gen
+
+  ex = _ex(created)
+  N = created['N']
+  S = ex.get('sample_size')
+  c.ok('bulk cell', f'S = {S} live, {N - (S or 0)} inserted')
+
+  def count(metric, **want):
+    return _count(records, metric, **want)
+
+  snap_r = next((r for r in records if r['metric'] == 'prepared_set'), None)
+  if snap_r is None:
+    c.fail('prepared-set snapshot recorded', 'no prepared_set record')
+    return
+  snap = _ex(snap_r)
+  m = snap.get('manifest') or {}
+
+  faces = helios_env.load_config('ballot_face.yaml')
+  cfg = helios_env.load_config('levels.yaml')
+  face_key = ex.get('ballot_face')
+  questions = votes_gen.build_questions(faces[face_key])
 
   # --- num_tallied == N ---------------------------------------------------
   tallied = {_ex(r).get('n_votes') for r in records
@@ -775,20 +830,11 @@ def _check_prepared(c, records, created, scheme):
     f'encryption metrics count == S = {S}',
     'each of ' + ', '.join(ENCRYPTION_METRICS) if not bad else '; '.join(bad))
 
-  want = S if mode == 'insert' else N
-  bad = [f'{mtr} {count(mtr)}' for mtr in CAST_METRICS if count(mtr) != want]
+  # Only the sample went through the real cast path; the rest was inserted.
+  bad = [f'{mtr} {count(mtr)}' for mtr in CAST_METRICS if count(mtr) != S]
   (c.ok if not bad else c.fail)(
-    f'cast and verification metrics count == {"S" if mode == "insert" else "N"}'
-    f' = {want}',
+    f'cast and verification metrics count == S = {S}',
     'each of ' + ', '.join(CAST_METRICS) if not bad else '; '.join(bad))
-  if mode == 'cast':
-    tags = [_ex(r).get('ballot_source') for r in records
-            if r['metric'] == 'verification_time_ns']
-    ok = tags.count('sample') == S and tags.count('bulk') == N - S
-    (c.ok if ok else c.fail)(
-      'verification records tagged sample / bulk',
-      f'{tags.count("sample")} sample, {tags.count("bulk")} bulk, '
-      f'{len(tags) - tags.count("sample") - tags.count("bulk")} untagged')
 
   # --- the key ----------------------------------------------------------------
   fps = {ex.get('key_fingerprint'), m.get('key_fingerprint'),
@@ -800,23 +846,9 @@ def _check_prepared(c, records, created, scheme):
     'election key fingerprint matches the manifest',
     next(iter(fps))[:16] if ok else f'fingerprints seen: {sorted(map(str, fps))}')
 
-  # --- operational records ------------------------------------------------------
-  for mtr in ('analyze', 'worker_restarted', 'pg_database_size'):
-    (c.ok if count(mtr) == 1 else c.fail)(f'{mtr} record present',
-                                          f'{count(mtr)} record(s)')
-  wr = next((r for r in records if r['metric'] == 'worker_restarted'), None)
-  if wr and _ex(wr).get('old_pid') == _ex(wr).get('new_pid'):
-    c.fail('worker restarted into a new process',
-           f'pid {_ex(wr).get("old_pid")} before and after')
-  peaks = {r['stage'] for r in records if r['metric'] == 'worker_peak_rss_bytes'
-           and r['value'] > 0}
-  (c.ok if peaks >= {'aggregate', 'decrypt'} else c.fail)(
-    'worker_peak_rss_bytes for Stage 3 and Stage 4',
-    ', '.join(f'{r["stage"]} {r["value"] / (1 << 20):.0f} MiB' for r in records
-              if r['metric'] == 'worker_peak_rss_bytes') or 'none')
-  if mode == 'insert':
-    (c.ok if count('bulk_spot_verified') == 1 else c.fail)(
-      'bulk ballots spot-verified', f'{count("bulk_spot_verified")} record(s)')
+  # --- what insert wrote was verified ---------------------------------------
+  (c.ok if count('bulk_spot_verified') == 1 else c.fail)(
+    'bulk ballots spot-verified', f'{count("bulk_spot_verified")} record(s)')
 
   # --- the set's provenance against the current config and checkout ---------
   try:

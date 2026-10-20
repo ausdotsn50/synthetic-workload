@@ -1,13 +1,8 @@
 """
-Stage 2, bulk population of a prepared cell: ballots S..N-1 of the prepared
-set go onto the board without passing through the browser.
-
-Two modes, chosen per cell (runner.py --populate):
-
-  cast    stage2_cast.cast_ballots with the prepared items, then
-          await_verification: the real HTTP + Celery path, ballot by ballot.
-  insert  insert_ballots below: the rows a verified cast leaves behind, written
-          directly. No Helios span runs, so nothing here is measured.
+Stage 2 of a bulk cell, after its live sample: ballots S..N-1 of the prepared
+set go onto the board as the rows a verified cast leaves behind, written
+directly. No Helios span runs, so nothing here is measured. Also ANALYZE,
+which every cell runs before its tally.
 
 insert_ballots builds each row with the calls the real path makes, in order:
 
@@ -153,7 +148,7 @@ def spot_indices(start, stop, k, seed):
 def analyze():
   """ANALYZE helios_voter; ANALYZE helios_castvote; -- so the tally's
   voter_set query plans against the populated tables, whichever way they were
-  filled. Returns seconds."""
+  filled (cast in a live cell, inserted in a bulk one). Returns seconds."""
   import time
   import helios_env
   helios_env.setup_django()
@@ -163,12 +158,3 @@ def analyze():
     c.execute('ANALYZE helios_voter')
     c.execute('ANALYZE helios_castvote')
   return time.perf_counter() - t0
-
-
-def database_size():
-  import helios_env
-  helios_env.setup_django()
-  from django.db import connection
-  with connection.cursor() as c:
-    c.execute('SELECT pg_database_size(current_database())')
-    return int(c.fetchone()[0])

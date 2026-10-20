@@ -1,24 +1,20 @@
 # Default values for level config
 #
-# Two measured arms, one command each (runner.py runs one cell; add --n/--rep):
+# Two measured arms, one command each (runner.py runs one cell; add --n/--rep,
+# and --prepared for a bulk cell):
 #   elgamal         python runner.py
-#   paillier-off    python runner.py --scheme paillier
-# each prefixed with `uv run --project ../helios-server`. At the same (N, rep)
-# both cast identical ballots (generator/votes.py, cell_seed), so the arms
-# compare pairwise.
+#   paillier-off    python runner.py --scheme paillier   (CRT proofs on, the
+#                                                         server's default)
+# each prefixed with `uv run --project ../helios-server`. Every cell casts
+# master_ballots(seed, ...)[:N] (generator/votes.py), so at the same N the arms
+# compare pairwise and live and bulk cells tally the same votes. Plans of many
+# cells live in config/*.yaml and run with sweep.py.
 schemes: [elgamal, paillier]
 
-# Paillier defaults, used when --crt-proofs is not given. This
-# is the server's own default: CRT decryption proofs on.
-paillier:
-  crt_proofs: true
-
-levels: # Electoral size/voter count
+levels: # Electoral size/voter count: runner.py's default N
   - 10
 
-repetitions: 3
-
-# For reproducibility, seed per config election run
+# The master ballot list's seed: every cell's plaintexts, in every mode
 seed: 424242
 
 ballot_face: nle2025 # key into config/ballot_face.yaml
@@ -51,12 +47,10 @@ measurement:
 # Prepared-ballot sets (prepare.py): one fixed key and one encrypted set per
 # (face, scheme), under <dir>/<face>/<scheme>/. Relative to the workload root.
 # Gitignored: the sets are large, and key.json holds a (synthetic) secret key.
-#   use          runner.py default; --prepared / --live override it
-#   sample_size  S: ballots 0..S-1 encrypted live, supplying every per-ballot
-#                metric; S..N-1 come from the set
-#   populate     how S..N-1 reach the board: cast (real HTTP + Celery path)
-#                or insert (the rows a verified cast leaves, written directly)
-prepared: {dir: prepared, use: false, sample_size: 10, populate: insert}
+#   sample_size  S, the default for runner.py --prepared --sample: ballots
+#                0..S-1 encrypted live, supplying every per-ballot metric;
+#                S..N-1 inserted from the set
+prepared: {dir: prepared, sample_size: 10}
 
 # Stage 2 measurement shaping, from the 2026-09-20 calibration run.
 encryption:

@@ -50,15 +50,14 @@ class MasterPrefixTests(unittest.TestCase):
         with self.subTest(face=face_key, N=N):
           self.assertEqual(big[:N], votes_gen.master_ballots(CFG['seed'], q, N))
 
-  def test_same_list_for_both_arms(self):
-    # No scheme input, so both arms read the same plaintexts; and the list is
-    # the levels.yaml seed's, not a cell_seed's.
+  def test_same_list_for_every_cell(self):
+    # No scheme, mode or rep input: every cell reads the levels.yaml seed's
+    # list, and another seed gives another list.
     q = votes_gen.build_questions(FACES['smoke'])
     self.assertEqual(votes_gen.master_ballots(CFG['seed'], q, 30),
                      votes_gen.generate_ballots(CFG['seed'], q, 30))
-    self.assertNotEqual(
-      votes_gen.master_ballots(CFG['seed'], q, 30),
-      votes_gen.generate_ballots(votes_gen.cell_seed(CFG['seed'], 30, 0), q, 30))
+    self.assertNotEqual(votes_gen.master_ballots(CFG['seed'], q, 30),
+                        votes_gen.master_ballots(CFG['seed'] + 1, q, 30))
 
 
 class ChunkPlanTests(unittest.TestCase):
@@ -324,7 +323,7 @@ class SwapThenFreezeTests(unittest.TestCase):
       base_url=base_url, short_name=f'wl-test-swap-{scheme}-{secrets.token_hex(2)}',
       name='workload test: swap then freeze',
       questions=votes_gen.build_questions(FACES['smoke']), n_voters=1,
-      scheme=scheme, ablation=runner.resolve_ablation(scheme, CFG),
+      scheme=scheme, ablation=runner.resolve_ablation(scheme),
       log=lambda m: None)
 
     generated = Election.objects.get(uuid=uuid).get_helios_trustee()
@@ -363,7 +362,7 @@ class SwapThenFreezeTests(unittest.TestCase):
       base_url=base_url, short_name=f'wl-test-nokey-{secrets.token_hex(2)}',
       name='workload test: generated key kept',
       questions=votes_gen.build_questions(FACES['smoke']), n_voters=1,
-      scheme='elgamal', ablation=runner.resolve_ablation('elgamal', CFG),
+      scheme='elgamal', ablation=runner.resolve_ablation('elgamal'),
       log=lambda m: None)
     stage0_setup.freeze(base_url=base_url, election_uuid=uuid,
                         log=lambda m: None)

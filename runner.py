@@ -1,25 +1,28 @@
 """
-Sample commands, one per measured arm:
-- uv run --project ../helios-server python runner.py --face smoke --n 10
-- uv run --project ../helios-server python runner.py --face smoke --n 10 --scheme paillier
+One cell, in one of two modes:
 
-Prepared cells (ballots from prepare.py; S live, N - S prepared):
-- uv run --project ../helios-server python runner.py --face smoke --n 10 --prepared --sample 3 --populate insert
-- uv run --project ../helios-server python runner.py --face smoke --n 10 --prepared --sample 3 --populate cast --scheme paillier
+  live   all N ballots encrypted in the browser, cast and verified
+         uv run --project ../helios-server python runner.py --face smoke --n 10
+  bulk   S live ballots as above, plus N - S prepared ballots (prepare.py)
+         inserted as the verified casts they would have become
+         uv run --project ../helios-server python runner.py --face smoke --n 10 --prepared --sample 3
 
-The arm is the scheme: elgamal, paillier-off. Both cast the same ballots at
-the same (N, rep) -- see generator/votes.py, cell_seed -- so arms compare
-pairwise. --crt-proofs defaults to the `paillier:` block in
-config/levels.yaml (CRT on, the server's own default).
+Add --scheme paillier for the other arm. The arm is the scheme: elgamal, or
+paillier-off, which runs with Paillier CRT decryption proofs on (the server's
+own default). Both modes and both arms cast master_ballots(seed, questions,
+N) -- generator/votes.py -- so every cell at the same N tallies the same votes
+and the arms compare pairwise.
 
 Execution is SERIAL by design (§3.8). At ~6.5 s of pure computation per ballot,
 concurrency on this machine would saturate CPU immediately and the numbers would
 measure the OS scheduler rather than cryptography.
 
-One cell == one election: fresh election, fresh voter list. A live cell also
-has a fresh trustee keypair and fresh ballots. A prepared cell still has
-Helios generate (and time) its keypair, then freezes under its set's fixed key,
-because the prepared ballots only verify under the key they were made with.
+One cell == one election: one scheme, one N, one repetition, one mode. Each
+starts on a fresh Celery worker and a fresh election and voter list, and
+nothing interrupts the election's own pipeline once it starts. Helios generates
+(and times) the trustee keypair in every cell; a bulk cell then freezes under
+its set's fixed key, because the prepared ballots only verify under the key
+they were made with.
 
 Nothing here is run automatically. Every stage is invoked explicitly.
 """
@@ -41,25 +44,16 @@ from emit import Emitter, make_run_id
 SHORT_NAME_MAX = 40
 
 
-def resolve_ablation(scheme, cfg, crt_proofs=None):
+def resolve_ablation(scheme):
   """
   The configuration a cell runs under, in Election.ablation_config's shape:
-  {} under ElGamal, {'paillier_use_crt_proofs'} under
-  Paillier. A flag given on the command line wins over the `paillier:` block
-  in config/levels.yaml. Raises ValueError on a flag the scheme cannot take.
+  {} under ElGamal, and under Paillier the server's own default, CRT
+  decryption proofs on. Still posted at election creation and recorded on
+  every record, so acceptance can check it against the election.
   """
   if scheme != 'paillier':
-    if crt_proofs is not None:
-      raise ValueError(f'--crt-proofs applies only to '
-                       f'--scheme paillier, and this cell is {scheme!r}')
     return {}
-
-  p = cfg.get('paillier') or {}
-  crt = ((crt_proofs == 'on') if crt_proofs is not None
-         else p.get('crt_proofs', True))
-  if not isinstance(crt, bool):
-    raise ValueError(f'paillier crt_proofs is {crt!r}, not true or false')
-  return {'paillier_use_crt_proofs': crt}
+  return {'paillier_use_crt_proofs': True}
 
 
 def arm_label(scheme, ablation):
@@ -71,7 +65,7 @@ def arm_label(scheme, ablation):
 
 def short_name_for(arm, N, rep, run_id, tag=''):
   """The election's short_name, refused before anything runs if the form would
-  refuse it. `tag` marks a prepared cell: -pc (populate cast), -pi (insert)."""
+  refuse it. `tag` marks a bulk cell (BULK_TAG)."""
   name = f'wl-{arm}-n{N}-r{rep}{tag}-{run_id[-4:]}'
   if len(name) > SHORT_NAME_MAX:
     raise ValueError(f'election short_name {name!r} is {len(name)} characters; '
@@ -79,8 +73,7 @@ def short_name_for(arm, N, rep, run_id, tag=''):
   return name
 
 
-def prepared_tag(populate):
-  return {'cast': '-pc', 'insert': '-pi'}[populate]
+BULK_TAG = '-b'
 
 
 def _trustee_fingerprint(election_uuid):
@@ -116,30 +109,28 @@ def _checked_bulk(set_dir, start, stop, master):
 
 # Cell run equivalent to one election run
 def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
-             headless=True, skip=(), prep=None):
+             headless=True, prep=None):
   """
   One cell. `prep` is None for a live cell -- all N encrypted in the browser
-  from cell_seed plaintexts, exactly as before -- or, for a prepared cell,
-  {'snapshot': prepared_set.snapshot_for_cell(...), 'sample': S,
-  'populate': 'cast'|'insert'}: S ballots live, N - S from the prepared set.
+  -- or, for a bulk cell, {'snapshot': prepared_set.snapshot_for_cell(...),
+  'sample': S}: S ballots live, N - S inserted from the prepared set.
   """
   # Usage of seed for reproducibility purposes
   seed_base = cfg['seed']
   base_url = helios_env.helios_url()
-  helios_path = helios_env.helios_path()
 
   # Import of votes and voters module from generator/
   from generator import votes as votes_gen
   from generator import voters as voters_gen
 
   arm = arm_label(scheme, ablation)
-  # Not keyed on the arm: every arm at this (N, rep) casts the same ballots.
-  # A prepared cell's plaintexts are master_ballots(seed_base, ...)[:N], the
-  # same for every (N, rep), so its records carry the base seed itself.
-  seed = seed_base if prep else votes_gen.cell_seed(seed_base, N, rep)
+  # Every cell, whatever its arm, mode or rep, casts master_ballots(seed_base,
+  # questions, N): the same votes at the same N, so arms pair and modes
+  # compare. The records carry the base seed itself.
+  seed = seed_base
   questions = votes_gen.build_questions(face)
   short_name = short_name_for(arm, N, rep, emitter.run_id,
-                              prepared_tag(prep['populate']) if prep else '')
+                              BULK_TAG if prep else '')
   S = prep['sample'] if prep else N
   # Per-ballot records of a prepared cell say which population they are from.
   src = {'ballot_source': 'sample'} if prep else {}
@@ -187,21 +178,33 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
   console.field('ballot face', f'{face_key} — {len(questions)} questions, '
                                f'{n_answers} answers')
   console.field('ciphertexts/ballot', n_answers)
-  console.field('cell seed', seed)
+  console.field('seed', f'{seed} (master_ballots[:{N}])')
   if prep:
-    console.field('ballots', f'prepared — {S} live sample, {N - S} '
-                             f'{prep["populate"]}')
+    console.field('mode', f'bulk — {S} live, {N - S} inserted from the '
+                          f'prepared set')
     console.field('prepared set', prep['snapshot']['dir'])
     console.field('key', prep['snapshot']['key_fingerprint'][:16])
     for w in prep['snapshot']['warnings']:
       console.warn(w)
   else:
-    console.field('ballots', 'live — all N encrypted in the browser')
+    console.field('mode', 'live — all N encrypted in the browser')
   console.field('election', short_name)
   console.field('output', emitter.path)
-  console.field('skipped', ', '.join(skip) if skip else '(nothing)')
 
   log = console.detail
+  from drivers import stage2_populate, worker
+
+  # Every cell starts on a fresh worker process: nothing a previous cell left
+  # in it (memory, caches, imported state) reaches this one, and nothing
+  # restarts it again until the next cell -- the election's own pipeline runs
+  # through uninterrupted.
+  with console.Stage('FRESH CELERY WORKER'):
+    w = worker.restart(log=log)
+  em('configure', 'worker_restarted', int(w['seconds'] * 1e9), 'ns',
+     {'operational': True, 'at': 'cell_start', 'old_pid': w['old_pid'],
+      'new_pid': w['new_pid'], 'pool': w['pool'], 'node': w['node'],
+      'cmdline': w['identity']['cmdline'],
+      'affinity': w['identity']['affinity']})
 
   # Stage 0 - see stage0_setup.py
   # See console.py (using a Stage object for pipeline wall-clock)
@@ -225,7 +228,6 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
       'arm': arm, 'ballot_face': face_key,
       'n_questions': len(questions), 'n_answers': n_answers,
       'ballots': 'prepared' if prep else 'live',
-      'populate': prep['populate'] if prep else None,
       'sample_size': S,
       'key_source': 'prepared' if prep else 'generated',
       'key_fingerprint': (prep['snapshot']['key_fingerprint'] if prep
@@ -248,7 +250,7 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
         'operational': True})
 
   # Stage 1 - freeze election
-  with console.Stage('STAGE 1 · FREEZE') as st:
+  with console.Stage('STAGE 1 · FREEZE'):
     # Key generation is NOT sampled here any more. keygen_time_ns and
     # prove_sk_time_ns are recorded by Helios inside Election.generate_trustee
     # (Stage 0, web process) for the key the election actually used. The
@@ -287,20 +289,18 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
   out_path = emitter.path.with_name(
     f'{emitter.run_id}-ballots-n{N}-r{rep}.jsonl') # Separate jsonl for the ballots
   
-  with console.Stage('STAGE 2 · ENCRYPTION (browser) + CAST') as st:
+  with console.Stage('STAGE 2 · ENCRYPTION (browser) + CAST'):
     from drivers import stage1_encrypt, stage2_cast
-    from generator import voters as voters_gen
 
+    # The tally's plaintexts: the master list's first N, in both modes. A
+    # bulk cell encrypts ballots 0..S-1 here and inserts the rest prepared.
+    ballots = votes_gen.master_ballots(seed, questions, N)
     if prep:
-      # The tally's plaintexts are the master list's first N; ballots
-      # 0..S-1 are encrypted live here, the rest come from the prepared set.
-      ballots = votes_gen.master_ballots(seed, questions, N)
       live = ballots[:S]
       console.step(f'encrypting the live sample: {S} of {N} ballots in Chrome')
       console.detail('the sample supplies every per-ballot metric; ballots '
-                     f'{S}..{N - 1} are prepared and populated below')
+                     f'{S}..{N - 1} are prepared and inserted below')
     else:
-      ballots = votes_gen.generate_ballots(seed, questions, N)
       live = ballots
       console.step(f'encrypting {N} ballots in Chrome')
       console.detail('these ballots are cast — the measured population and the '
@@ -370,64 +370,33 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
     stage2_cast.await_verification(election_uuid, n_cast, log=log)
     stage_wall('encrypt', 'stage 2 verify', time.perf_counter() - t0)
 
-  from drivers import stage2_populate, worker
   if prep:
-    mode = prep['populate']
     bulk = _checked_bulk(prep['snapshot']['dir'], S, N, ballots)
-    with console.Stage(f'STAGE 2 · POPULATE {N - S} PREPARED BALLOTS '
-                       f'({mode})') as stp:
-      if mode == 'cast':
-        # Bulk off: the real HTTP + Celery path, ballot by ballot.
-        console.step(f'casting ballots {S}..{N - 1} through the real HTTP flow')
-        _n, bulk_payloads = stage2_cast.cast_ballots(
-          base_url=base_url, election_uuid=election_uuid, encrypted=bulk,
-          credentials=credentials[S:N], total=N - S, log=log)
-        for k, p in enumerate(bulk_payloads):
-          em('encrypt', 'cast_payload_bytes', p['payload_bytes'], 'bytes',
-             {'tier': 'flow', 'sample': S + k, 'json_bytes': p['json_bytes'],
-              'ballot_source': 'bulk'})
-        console.step('waiting for Celery ballot verification')
-        stage2_cast.await_verification(election_uuid, N, log=log)
-      else:
-        # Bulk on: the rows a verified cast leaves behind, written directly.
-        console.step(f'storing ballots {S}..{N - 1} as verified casts')
-        stage2_populate.insert_ballots(
-          election_uuid=election_uuid, encrypted=bulk,
-          credentials=credentials[S:N], total=N - S, sidecar=sidecar, log=log)
+    with console.Stage(f'STAGE 2 · INSERT {N - S} PREPARED BALLOTS') as stp:
+      # The rows a verified cast leaves behind, written directly.
+      console.step(f'storing ballots {S}..{N - 1} as verified casts')
+      stage2_populate.insert_ballots(
+        election_uuid=election_uuid, encrypted=bulk,
+        credentials=credentials[S:N], total=N - S, sidecar=sidecar, log=log)
       stage2_populate.check_board(election_uuid, N)
     stage_wall('encrypt', 'stage 2 populate', stp.wall)
 
-    if mode == 'insert':
-      # Untimed: what insert wrote must verify where Celery never looked.
-      idx = stage2_populate.spot_indices(S, N, 5, f'{seed}|{N}|{rep}|spot')
-      ok = stage2_populate.spot_verify(election_uuid, idx, credentials)
-      if not all(ok.values()):
-        raise RuntimeError(f'inserted ballots fail vote.verify: '
-                           f'{[i for i, v in ok.items() if not v]}')
-      em('encrypt', 'bulk_spot_verified', len(idx), 'count',
-         {'operational': True, 'indices': idx,
-          'note': 'vote.verify(election) on stored rows, untimed'})
-      console.ok(f'{len(idx)} inserted ballots verify: {idx}')
+    # Untimed: what insert wrote must verify where Celery never looked.
+    idx = stage2_populate.spot_indices(S, N, 5, f'{seed}|{N}|{rep}|spot')
+    ok = stage2_populate.spot_verify(election_uuid, idx, credentials)
+    if not all(ok.values()):
+      raise RuntimeError(f'inserted ballots fail vote.verify: '
+                         f'{[i for i, v in ok.items() if not v]}')
+    em('encrypt', 'bulk_spot_verified', len(idx), 'count',
+       {'operational': True, 'indices': idx,
+        'note': 'vote.verify(election) on stored rows, untimed'})
+    console.ok(f'{len(idx)} inserted ballots verify: {idx}')
 
-    # Both modes: statistics for the tally's voter_set query, however the
-    # tables were filled.
-    t_an = stage2_populate.analyze()
-    em('encrypt', 'analyze', int(t_an * 1e9), 'ns',
-       {'operational': True, 'tables': ['helios_voter', 'helios_castvote']})
-
-  em('encrypt', 'pg_database_size', stage2_populate.database_size(), 'bytes',
-     {'operational': True, 'note': 'after population'})
-
-  if prep:
-    # Both modes: the tally starts on a worker process that has done nothing
-    # since it started, whatever population ran through it.
-    console.step('restarting the Celery worker (fresh process for the tally)')
-    w = worker.restart(log=log)
-    em('encrypt', 'worker_restarted', int(w['seconds'] * 1e9), 'ns',
-       {'operational': True, 'old_pid': w['old_pid'], 'new_pid': w['new_pid'],
-        'pool': w['pool'], 'node': w['node'],
-        'cmdline': w['identity']['cmdline'],
-        'affinity': w['identity']['affinity']})
+  # Every cell: statistics for the tally's voter_set query, however the tables
+  # were filled, so live and bulk cells tally against the same planner state.
+  t_an = stage2_populate.analyze()
+  em('encrypt', 'analyze', int(t_an * 1e9), 'ns',
+     {'operational': True, 'tables': ['helios_voter', 'helios_castvote']})
 
   # ---- STAGES 3+4 · THE REAL FLOW, INSTRUMENTED -----------------------------
   # There is exactly ONE execution. Each stage drives its own phase through the
@@ -441,7 +410,8 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
   timeout_s = m_cfg.get('timeout_s', 3600)
 
   # Operational, every cell: the worker's peak RSS is what sets max N, since
-  # compute_tally loads every voter row at once (models.py:552).
+  # compute_tally loads every voter row at once (models.py:552). The worker is
+  # the one restarted at the start of this cell.
   _node, w_info = worker.the_worker()
   probe = worker.MemoryProbe(w_info['pid']).start()
   try:
@@ -474,6 +444,11 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
     em(stage_label, 'worker_peak_rss_bytes', pk['peak_tree_rss'], 'bytes',
        {'operational': True, 'pid': w_info['pid'],
         'interval_s': probe.interval_s, **pk})
+  # Where the tally started from: the probe's first reading as Stage 3 began,
+  # after this cell's whole population had gone through the worker.
+  em('aggregate', 'worker_rss_at_tally_start_bytes',
+     peaks['aggregate']['first_tree_rss'], 'bytes',
+     {'operational': True, 'pid': w_info['pid']})
 
   # The tally these exact ballots must decrypt to, counted in the clear from the
   # plaintexts. acceptance.py fails the cell unless Helios's result equals it.
@@ -495,23 +470,10 @@ def run_cell(*, scheme, N, rep, cfg, face, emitter, ablation, face_key='?',
       raise RuntimeError(msg)
     console.warn(msg)
   else:
-    # Prepared cells: each verification record is a sample or a bulk ballot,
-    # through cast_vote_id -> voter -> index. Under insert only the sample has
-    # any; under cast, all N do.
-    index_of = (measure_join.ballot_index_by_cast_vote(election_uuid)
-                if prep else {})
     for metric, metric_rows in sorted(rows.items()):
-      if metric in measure_join.SKIP_EMIT:
-        continue
       for r in metric_rows:
-        extra = measure_join.extra_for(r)
-        if prep and metric in measure_join.PER_BALLOT:
-          i = index_of.get(r.get('cast_vote_id'))
-          extra['ballot_index'] = i
-          extra['ballot_source'] = (None if i is None
-                                    else 'sample' if i < S else 'bulk')
         em(measure_join.STAGE_OF.get(metric, 'decrypt'), metric, r['value'],
-           r.get('unit', 'ns'), extra)
+           r.get('unit', 'ns'), measure_join.extra_for(r))
       # No value echo here: the summary prints each metric in its section
       # (crypto, ZKP, payload sizes, payload-driven timing).
 
@@ -563,30 +525,21 @@ def main(argv=None):
   # Parse CLI args
   p = argparse.ArgumentParser(description='Run one workload cell (spec PART 3)')
   p.add_argument('--scheme', default=None, help='default: first in levels.yaml')
-  # Paillier only. Unset means the `paillier:` block in levels.yaml.
-  p.add_argument('--crt-proofs', choices=('on', 'off'), default=None,
-                 help='Paillier CRT decryption proofs; default from levels.yaml')
   p.add_argument('--n', type=int, default=None, help='default: first level')
   p.add_argument('--rep', type=int, default=0)
   p.add_argument('--face', default=None, help='ballot face key; default from config')
   p.add_argument('--headed', action='store_true', help='show the browser')
-  # '2a' is accepted as an alias for '2' so older invocations keep working.
-  # Skipping Stage 2 leaves the board empty, so Stage 3 will find nothing to
-  # aggregate — useful only for exercising Stages 0/1 on their own.
-  p.add_argument('--skip', default='', help='comma-separated: 2')
   p.add_argument('--strict', action='store_true',
                  help='treat provenance warnings as fatal (use for real runs)')
   p.add_argument('--no-preflight', action='store_true')
-  # Prepared cells (prepare.py). Defaults from the `prepared:` block.
+  # The mode. Live unless --prepared.
   g = p.add_mutually_exclusive_group()
-  g.add_argument('--prepared', action='store_true', default=None,
-                 help='S live ballots, N - S from the prepared set')
+  g.add_argument('--prepared', action='store_true',
+                 help='bulk: S live ballots, N - S inserted from the prepared set')
   g.add_argument('--live', action='store_true',
-                 help='all N encrypted live, whatever prepared.use says')
+                 help='live: all N encrypted in the browser (the default)')
   p.add_argument('--sample', type=int, default=None,
-                 help='live sample size S; default prepared.sample_size')
-  p.add_argument('--populate', choices=('cast', 'insert'), default=None,
-                 help='how N - S reach the board; default prepared.populate')
+                 help='bulk: live sample size S; default prepared.sample_size')
   p.add_argument('--run-id', default=None,
                  help='use this run id (sweep.py picks it to find the output)')
   args = p.parse_args(argv)
@@ -595,19 +548,15 @@ def main(argv=None):
   cfg = helios_env.load_config('levels.yaml')
   faces = helios_env.load_config('ballot_face.yaml')
   pcfg = cfg.get('prepared') or {}
-  use_prepared = (False if args.live
-                  else bool(args.prepared or pcfg.get('use', False)))
 
   scheme = args.scheme or cfg['schemes'][0]
   N = args.n if args.n is not None else cfg['levels'][0] # N voters
   face_key = args.face or cfg['ballot_face'] # Curr choices: smoke or nle2025
   face = faces[face_key]
-  skip = tuple(x.strip() for x in args.skip.split(',') if x.strip())
   base_url = helios_env.helios_url()
 
-  # Gate BEFORE any stage runs. Not reachable by --skip: skipping a stage must
-  # never be a route to emitting records that claim a scheme this checkout
-  # cannot actually execute. See schemes.py.
+  # Gate BEFORE any stage runs: a cell must never emit records that claim a
+  # scheme this checkout cannot actually execute. See schemes.py.
   try:
     schemes.require(scheme)
   except (schemes.UnsupportedScheme, KeyError) as e:
@@ -620,16 +569,16 @@ def main(argv=None):
   # The run id's suffix is always 4 characters, so a placeholder sizes the name.
   prep = None
   try:
-    ablation = resolve_ablation(scheme, cfg,
-                                crt_proofs=args.crt_proofs)
-    if use_prepared:
+    ablation = resolve_ablation(scheme)
+    if args.prepared:
       S = args.sample if args.sample is not None else pcfg.get('sample_size', 10)
-      populate = args.populate or pcfg.get('populate', 'insert')
       if not 1 <= S <= N:
         raise ValueError(f'--sample {S} must be between 1 and N = {N}')
-      prep = {'sample': S, 'populate': populate}
+      prep = {'sample': S}
+    elif args.sample is not None:
+      raise ValueError('--sample applies only to a bulk cell (--prepared)')
     short_name_for(arm_label(scheme, ablation), N, args.rep, 'xxxx',
-                   prepared_tag(prep['populate']) if prep else '')
+                   BULK_TAG if prep else '')
     if args.run_id and not re.fullmatch(RUN_ID_RE, args.run_id):
       raise ValueError(f'--run-id {args.run_id!r} is not a run id '
                        f'(e.g. 2026-08-17T04:22:31Z-a1b2)')
@@ -638,9 +587,9 @@ def main(argv=None):
     console.fail(str(e))
     return 2
 
-  # A prepared cell checks its set before anything runs: a set from another
-  # face, seed, booth or key size, too short, or not validated to N, stops the
-  # cell here. A different Helios commit is only a warning.
+  # A bulk cell checks its set before anything runs: a set from another face,
+  # seed, booth or key size, too short, or not validated to N, stops the cell
+  # here. A different Helios commit is only a warning.
   if prep:
     from drivers import prepared_set
     from generator import votes as votes_gen
@@ -653,8 +602,7 @@ def main(argv=None):
       return 2
 
   if not args.no_preflight:
-    if not preflight.check(base_url, need_browser=('2a' not in skip),
-                           strict=args.strict):
+    if not preflight.check(base_url, strict=args.strict):
       return 2
 
   run_id = args.run_id or make_run_id()
@@ -663,7 +611,7 @@ def main(argv=None):
     try:
       out = run_cell(scheme=scheme, N=N, rep=args.rep, cfg=cfg, face=face,
                      emitter=em, ablation=ablation, face_key=face_key,
-                     headless=not args.headed, skip=skip, prep=prep)
+                     headless=not args.headed, prep=prep)
     except Exception as e:
       console.section('ABORTED')
       console.fail(f'{type(e).__name__}: {e}')

@@ -1,10 +1,13 @@
 """
 Seeded plaintext vote generation.
 
-Every cell is reproducible from (base_seed, N, rep) alone — no shared RNG
-state between cells, so a single cell can be re-run in isolation and produce
-identical plaintext votes. The scheme is deliberately not an input: see
-cell_seed.
+Every cell casts master_ballots(seed, questions, N): ballot i is the same in
+every cell that has one, whatever its arm, mode or repetition. Neither the
+scheme nor the rep is an input, so both arms at the same N cast identical
+ballots and must produce identical tallies (a paired comparison), and a live
+and a bulk cell at the same N tally the same votes. The seed is levels.yaml
+`seed`, recorded on every record, so any cell's ballots can be regenerated
+exactly.
 
 Note what is NOT modelled: a skewed / worst-case vote distribution. Spec §0.1 shows
 Helios recovers discrete logs from a precomputed table walked to `num_tallied`, not
@@ -13,25 +16,7 @@ A skewed condition would therefore measure nothing. Uniform selection is used an
 the distribution-independence is itself the finding.
 """
 
-import hashlib
 import random
-
-# Same inputs, same plaintext ballots
-# Purpose: repoducibility
-# Ot: election seed; marked in .jsonl column
-def cell_seed(base_seed, N, rep):
-  """
-  Derive a per-cell seed deterministically. Hashing rather than arithmetic mixing
-  so neighbouring cells do not get correlated streams.
-
-  The scheme is not hashed in, so both arms --
-  elgamal and paillier-off -- at the same (N, rep) cast identical
-  ballots and must produce identical tallies. That makes the comparison between
-  arms a paired one. The seed itself is recorded on every record, so any cell's
-  ballots can still be regenerated exactly.
-  """
-  key = f'{base_seed}|{N}|{rep}'.encode()
-  return int.from_bytes(hashlib.sha256(key).digest()[:8], 'big')
 
 # Expand a ballot_face.yaml entry into Helios question dicts.
 def build_questions(face):
@@ -80,15 +65,15 @@ def generate_ballots(seed, questions, count):
 
 def master_ballots(seed, questions, count):
   """
-  The one plaintext list every prepared-ballot set is cut from: ballot i of any
-  prepared cell is master_ballots(seed, questions, M)[i].
+  The one plaintext list every cell casts from, and every prepared-ballot set
+  is cut from: ballot i of any cell is master_ballots(seed, questions, M)[i].
 
   generate_ballots draws every ballot from one sequential RNG, so a longer list
   only appends: master_ballots(s, q, M)[:N] == master_ballots(s, q, N). That
   prefix property is what lets one prepared set of M ballots serve every N <= M
   and be extended later without re-encrypting what is already there. The seed
-  is levels.yaml `seed` itself, not cell_seed: the list does not depend on the
-  arm, so both arms still cast identical ballots at the same N.
+  is levels.yaml `seed`, and the list depends on neither the arm nor the mode,
+  so every cell at the same N casts identical ballots.
   """
   return generate_ballots(seed, questions, count)
 

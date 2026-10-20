@@ -312,7 +312,7 @@ def generation_election(d, manifest, face_key, scheme, questions, key, cfg):
                   f'made through its HTTP API')
 
   short_name = f'{GEN_PREFIX}-{face_key}-{scheme}-{secrets.token_hex(2)}'
-  ablation = runner.resolve_ablation(scheme, cfg)
+  ablation = runner.resolve_ablation(scheme)
   console.step(f'creating generation election {short_name}')
   uuid = stage0_setup.configure(
     base_url=base_url, short_name=short_name,

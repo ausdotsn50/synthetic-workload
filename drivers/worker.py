@@ -1,6 +1,6 @@
 """
-The Celery worker: made a fresh process before a prepared cell's tally, and its
-memory watched while it tallies.
+The Celery worker: a fresh process at the start of every cell, and its memory
+watched while it tallies.
 
 Restart
 -------
@@ -13,9 +13,9 @@ restart() sends the worker a warm shutdown -- the broadcast `celery -A helios
 control shutdown` sends, through the same app -- and waits until a worker with
 a NEW pid answers `inspect ping`. The loop brings it back with the same
 command, env and pinning, so the harness never decides how the worker is
-started. Before a prepared tally the worker has had either N - S Celery
-verifications (cast) or none (insert) since it last started; restarting in both
-modes puts both on the same footing.
+started. runner.py calls it once per cell, before Stage 0, so no cell inherits
+what an earlier one left in the worker, and never again inside the election:
+its pipeline runs through on one worker process.
 
 Memory
 ------
@@ -142,6 +142,9 @@ class MemoryProbe:
       probe.stage('aggregate'); ...; probe.stage('decrypt'); ...
       peaks = probe.stop()
 
+  Each stage also keeps first_tree_rss, its first reading: the one stage()
+  takes as the stage begins.
+
   Samples only while a stage is set, and also on every stage change and at
   stop, so a stage shorter than one interval (a smoke-face tally) still has
   samples rather than a peak of zero. A child that exits between listing and
@@ -166,7 +169,8 @@ class MemoryProbe:
     self._record()                 # the end of the stage being left
     with self._lock:
       self._label = label
-      self._peaks.setdefault(label, {'peak_tree_rss': 0, 'peak_main_rss': 0,
+      self._peaks.setdefault(label, {'first_tree_rss': None,
+                                     'peak_tree_rss': 0, 'peak_main_rss': 0,
                                      'peak_child_rss': 0, 'max_processes': 0,
                                      'samples': 0, 'main_gone': False})
     self._record()                 # the start of the new one
@@ -205,6 +209,8 @@ class MemoryProbe:
         pk['main_gone'] = True
         return
       pk['samples'] += 1
+      if pk['first_tree_rss'] is None:
+        pk['first_tree_rss'] = sum(rss.values())
       pk['peak_tree_rss'] = max(pk['peak_tree_rss'], sum(rss.values()))
       pk['peak_main_rss'] = max(pk['peak_main_rss'], rss[self.pid])
       children = [v for k, v in rss.items() if k != self.pid]
