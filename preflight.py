@@ -31,12 +31,10 @@ def _port_open(host, port, timeout=2):
     return False
 
 
-def check(base_url, *, need_browser=True, strict=False):
+def check(base_url, *, strict=False):
   """
-  Returns True if the run may proceed.
-
-  need_browser=False when Stage 2a is skipped — Chrome is then irrelevant and a
-  missing browser should not block an otherwise valid run.
+  Returns True if the run may proceed. Every cell encrypts in Chrome, so a
+  missing browser blocks it.
   """
   console.section('PREFLIGHT')
   hard_fail = False
@@ -77,17 +75,14 @@ def check(base_url, *, need_browser=True, strict=False):
     console.fail('node not on PATH — Stage 2b cannot encrypt ballots')
     hard_fail = True
 
-  # Check for Chrome/Chrome v.  
-  if need_browser:
-    import emit
-    chrome = emit._chrome_version()
-    if chrome:
-      console.ok(f'chrome: {chrome}')
-    else:
-      console.fail('Chrome not found — Stage 2a needs it (or pass --skip 2a)')
-      hard_fail = True
+  # Check for Chrome/Chrome v.
+  import emit
+  chrome = emit._chrome_version()
+  if chrome:
+    console.ok(f'chrome: {chrome}')
   else:
-    console.detail('chrome not checked (Stage 2a skipped)')
+    console.fail('Chrome not found — Stage 2 encrypts ballots in it')
+    hard_fail = True
 
   hp = helios_env.helios_path() # Loads levels.yaml
   wp = helios_env.WORKLOAD_ROOT # Workload root

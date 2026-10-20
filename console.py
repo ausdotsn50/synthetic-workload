@@ -112,7 +112,7 @@ class Progress:
   """
   Rate + ETA for a loop whose per-item cost is the thing we care about.
 
-  Printed after each reported item, never between a Timer's t0 and t1.
+  Printed after each reported item, never inside a timed span.
   """
 
   def __init__(self, total, label, every=None):
@@ -578,7 +578,7 @@ if __name__ == '__main__':
     records = [json.loads(line) for line in f if line.strip()]
   r0 = records[0]
   N = r0['N']
-  # The arm (elgamal, paillier-off/short/long) is recorded on election_created;
+  # The arm (elgamal, paillier-off) is recorded on election_created;
   # a run from before arms existed has only the scheme.
   created = _first(records, 'election_created')
   arm = ((created or {}).get('extra') or {}).get('arm')

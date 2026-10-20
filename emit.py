@@ -144,25 +144,3 @@ def make_run_id(stamp=None):
   t = time.gmtime(stamp) if stamp else time.gmtime()
   return time.strftime('%Y-%m-%dT%H:%M:%SZ', t) + '-' + secrets.token_hex(2)
   # Added secrets suffix for anti-collission purposes
-
-# Src: GFG - https://www.geeksforgeeks.org/python/python-time-perf_counter_ns-function/
-# Nanoseconds precision compared to normal time_perf_counter()
-# Real-user facing latency uses wall clock time instead of merely CPU time
-# Monotonic
-class Timer:
-  """
-  perf_counter_ns stopwatch (§3.6/§3.7 use perf_counter_ns explicitly — it is
-  monotonic and does not skip when the system clock is adjusted mid-run).
-
-      with Timer() as t:
-          ...
-      t.ns
-  """
-
-  def __enter__(self):
-    self._t0 = time.perf_counter_ns() # Func for benchmarking code - methodology based
-    return self
-
-  def __exit__(self, *exc):
-    self.ns = time.perf_counter_ns() - self._t0
-    return False
