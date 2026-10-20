@@ -113,6 +113,28 @@ def read_sidecar(path, election_uuid):
   return out
 
 
+# Per-ballot sidecar metrics. Their rows carry cast_vote_id, which is how a
+# prepared cell tells a sample ballot's verification from a bulk one's.
+PER_BALLOT = {'verification_time_ns', 'verification_only_ns'}
+
+
+def ballot_index_by_cast_vote(election_uuid):
+  """
+  {cast_vote_id: ballot index}, through cast_vote -> voter -> its position in
+  the voter order fetch_credentials uses (voter_login_id), which is the order
+  ballots are assigned to voters in Stage 2.
+  """
+  import helios_env
+  helios_env.setup_django()
+  from helios.models import CastVote, Voter
+  order = list(Voter.objects.filter(election__uuid=election_uuid)
+               .order_by('voter_login_id').values_list('id', flat=True))
+  pos = {voter_id: i for i, voter_id in enumerate(order)}
+  return {cv_id: pos[voter_id] for cv_id, voter_id in
+          CastVote.objects.filter(voter__election__uuid=election_uuid)
+          .values_list('id', 'voter_id')}
+
+
 def tier_of(metric):
   return 'flow' if metric in PAYLOAD_METRICS else 'operation'
 

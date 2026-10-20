@@ -6,8 +6,7 @@
 # each prefixed with `uv run --project ../helios-server`. At the same (N, rep)
 # both cast identical ballots (generator/votes.py, cell_seed), so the arms
 # compare pairwise.
-schemes:
-  - elgamal
+schemes: [elgamal, paillier]
 
 # Paillier defaults, used when --crt-proofs is not given. This
 # is the server's own default: CRT decryption proofs on.
@@ -29,20 +28,6 @@ ballot_face: nle2025 # key into config/ballot_face.yaml
 # production cost but it is paid at CAST time in Celery, per ballot, not at tally.
 # There is no tally-time verification metric and no max-N gate for one.
 
-# Stage 2a sampled encryption. Pilot at n0, then derive n
-pilot:
-  n0: 1000
-  target_ci_fraction: 0.05   # 95% CI within ±5% of the mean
-  z: 1.96
-
-# Stage 2b bulk generation
-#   pool_size: null      -> every ballot distinct 
-#   pool_size: <int>     -> ballot-pool reuse
-#   stream: true         -> never persist the board 
-bulk:
-  pool_size: 5 # Temporarily removed pool_size logic
-  stream: false
-
 # Timings are taken inside Helios's own code paths (helios/measure.py -- on
 # helios-server master, and merged into paillier-helios, which the server runs).
 # The harness drives the real flow, polls for phase completion, and joins the
@@ -62,6 +47,16 @@ measurement:
                       # are exact, both endpoints being in-process.
   timeout_s: 3600
   require_instrumentation: true   # fail the run if sidecar records are missing
+
+# Prepared-ballot sets (prepare.py): one fixed key and one encrypted set per
+# (face, scheme), under <dir>/<face>/<scheme>/. Relative to the workload root.
+# Gitignored: the sets are large, and key.json holds a (synthetic) secret key.
+#   use          runner.py default; --prepared / --live override it
+#   sample_size  S: ballots 0..S-1 encrypted live, supplying every per-ballot
+#                metric; S..N-1 come from the set
+#   populate     how S..N-1 reach the board: cast (real HTTP + Celery path)
+#                or insert (the rows a verified cast leaves, written directly)
+prepared: {dir: prepared, use: false, sample_size: 10, populate: insert}
 
 # Stage 2 measurement shaping, from the 2026-09-20 calibration run.
 encryption:

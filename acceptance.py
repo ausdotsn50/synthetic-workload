@@ -31,6 +31,16 @@ REQUIRED_STAGES = {'configure', 'freeze', 'encrypt',
 STAGE_WALLS = {'stage 0 configure', 'stage 1 freeze', 'stage 2 encrypt',
                'stage 2 cast', 'stage 2 verify', 'stage 3 aggregate',
                'stage 4 decrypt'}
+# A prepared cell also populates N - S ballots after the live sample.
+PREPARED_STAGE_WALLS = STAGE_WALLS | {'stage 2 populate'}
+
+# Per-ballot metrics of the live sample alone, in every prepared cell.
+ENCRYPTION_METRICS = ('encryption_time_ms', 'encryption_proof_ms',
+                      'ciphertext_bytes', 'proof_bytes')
+# Per-ballot metrics of whatever went through the real cast path: the sample
+# under insert, all N under cast.
+CAST_METRICS = ('cast_payload_bytes', 'verification_time_ns',
+                'verification_only_ns')
 
 # Required metrics are SCHEME-DEPENDENT (build spec §8.3). The dlog metrics
 # belong to ElGamal alone; requiring them of a Paillier run would fail a correct
@@ -363,12 +373,16 @@ def check(path, expected_n=10):
     '' if not derived else 'derived: ' + ', '.join(derived))
 
   # The console re-prints WALL CLOCK and the projection from these alone.
+  created = next((r for r in records if r['metric'] == 'election_created'),
+                 None)
+  prepared = ((created or {}).get('extra') or {}).get('ballots') == 'prepared'
+  want_walls = PREPARED_STAGE_WALLS if prepared else STAGE_WALLS
   walls = [_ex(r).get('stage_name') for r in records
            if r['metric'] == 'stage_wall_time_ns']
-  missing_w = STAGE_WALLS - set(walls)
-  extra_w = sorted(set(walls) - STAGE_WALLS, key=str)
-  name_w = f'all {len(STAGE_WALLS)} stage walls present'
-  if not missing_w and not extra_w and len(walls) == len(STAGE_WALLS):
+  missing_w = want_walls - set(walls)
+  extra_w = sorted(set(walls) - want_walls, key=str)
+  name_w = f'all {len(want_walls)} stage walls present'
+  if not missing_w and not extra_w and len(walls) == len(want_walls):
     c.ok(name_w, f'{len(walls)} stage_wall_time_ns records')
   else:
     c.fail(name_w,
@@ -688,7 +702,154 @@ def check(path, expected_n=10):
     (c.ok if got == expected_n else c.fail)(
       f'N = {expected_n} ballots tallied', f'got {got}')
 
+  if prepared:
+    _check_prepared(c, records, created, scheme)
+
   return c.report()
+
+
+def _check_prepared(c, records, created, scheme):
+  """
+  The checks a prepared cell adds (§2.7). Live cells never reach here.
+
+  The set's provenance is checked against the snapshot the runner recorded
+  before Stage 0, not against whatever the set directory holds now: a set
+  extended since this cell ran still describes this cell correctly.
+  """
+  import helios_env
+  from drivers import prepared_set as ps
+  from generator import votes as votes_gen
+
+  ex = created.get('extra') or {}
+  N = created['N']
+  S = ex.get('sample_size')
+  mode = ex.get('populate')
+  c.ok('prepared cell', f'S = {S} live, {N - (S or 0)} by {mode}')
+
+  def _ex(r):
+    return r.get('extra') or {}
+
+  def count(metric, **want):
+    return sum(1 for r in records if r['metric'] == metric
+               and all(_ex(r).get(k) == v for k, v in want.items()))
+
+  snap_r = next((r for r in records if r['metric'] == 'prepared_set'), None)
+  if snap_r is None:
+    c.fail('prepared-set snapshot recorded', 'no prepared_set record')
+    return
+  snap = _ex(snap_r)
+  m = snap.get('manifest') or {}
+
+  # --- the tally: master[:N], counted again here, from config alone --------
+  faces = helios_env.load_config('ballot_face.yaml')
+  cfg = helios_env.load_config('levels.yaml')
+  face_key = ex.get('ballot_face')
+  questions = votes_gen.build_questions(faces[face_key])
+  expected = votes_gen.expected_tally(
+    questions, votes_gen.master_ballots(cfg['seed'], questions, N))
+  res = next((r for r in reversed(records) if r['metric'] == 'result'), None)
+  name = 'result equals expected_tally(master[:N])'
+  if res is None:
+    c.fail(name, 'no result record')
+  elif res['value'] != expected:
+    c.fail(name, f'Helios decrypted {res["value"]}, master[:{N}] counts '
+                 f'{expected}')
+  elif (_ex(res).get('expected')) != expected:
+    c.fail(name, 'the runner recorded a different expected tally')
+  else:
+    c.ok(name, f'{expected}')
+
+  # --- num_tallied == N ---------------------------------------------------
+  tallied = {_ex(r).get('n_votes') for r in records
+             if r['metric'] in ('aggregation_time_ns', 'aggregation_only_ns')}
+  tallied |= {_ex(r).get('num_tallied') for r in records
+              if r['metric'] == 'dlog_precompute_time_ns'}
+  tallied.discard(None)
+  (c.ok if tallied == {N} else c.fail)(
+    'num_tallied == N', f'{sorted(tallied)} for N = {N}')
+
+  # --- per-ballot counts ----------------------------------------------------
+  bad = [f'{mtr} {count(mtr, source="browser")}' for mtr in ENCRYPTION_METRICS
+         if count(mtr, source='browser') != S]
+  (c.ok if not bad else c.fail)(
+    f'encryption metrics count == S = {S}',
+    'each of ' + ', '.join(ENCRYPTION_METRICS) if not bad else '; '.join(bad))
+
+  want = S if mode == 'insert' else N
+  bad = [f'{mtr} {count(mtr)}' for mtr in CAST_METRICS if count(mtr) != want]
+  (c.ok if not bad else c.fail)(
+    f'cast and verification metrics count == {"S" if mode == "insert" else "N"}'
+    f' = {want}',
+    'each of ' + ', '.join(CAST_METRICS) if not bad else '; '.join(bad))
+  if mode == 'cast':
+    tags = [_ex(r).get('ballot_source') for r in records
+            if r['metric'] == 'verification_time_ns']
+    ok = tags.count('sample') == S and tags.count('bulk') == N - S
+    (c.ok if ok else c.fail)(
+      'verification records tagged sample / bulk',
+      f'{tags.count("sample")} sample, {tags.count("bulk")} bulk, '
+      f'{len(tags) - tags.count("sample") - tags.count("bulk")} untagged')
+
+  # --- the key ----------------------------------------------------------------
+  fps = {ex.get('key_fingerprint'), m.get('key_fingerprint'),
+         snap.get('key_fingerprint')}
+  fps |= {_ex(r).get('key_fingerprint') for r in records
+          if r['metric'] == 'key_fingerprint_checked'}
+  ok = len(fps) == 1 and None not in fps and count('key_fingerprint_checked')
+  (c.ok if ok else c.fail)(
+    'election key fingerprint matches the manifest',
+    next(iter(fps))[:16] if ok else f'fingerprints seen: {sorted(map(str, fps))}')
+
+  # --- operational records ------------------------------------------------------
+  for mtr in ('analyze', 'worker_restarted', 'pg_database_size'):
+    (c.ok if count(mtr) == 1 else c.fail)(f'{mtr} record present',
+                                          f'{count(mtr)} record(s)')
+  wr = next((r for r in records if r['metric'] == 'worker_restarted'), None)
+  if wr and _ex(wr).get('old_pid') == _ex(wr).get('new_pid'):
+    c.fail('worker restarted into a new process',
+           f'pid {_ex(wr).get("old_pid")} before and after')
+  peaks = {r['stage'] for r in records if r['metric'] == 'worker_peak_rss_bytes'
+           and r['value'] > 0}
+  (c.ok if peaks >= {'aggregate', 'decrypt'} else c.fail)(
+    'worker_peak_rss_bytes for Stage 3 and Stage 4',
+    ', '.join(f'{r["stage"]} {r["value"] / (1 << 20):.0f} MiB' for r in records
+              if r['metric'] == 'worker_peak_rss_bytes') or 'none')
+  if mode == 'insert':
+    (c.ok if count('bulk_spot_verified') == 1 else c.fail)(
+      'bulk ballots spot-verified', f'{count("bulk_spot_verified")} record(s)')
+
+  # --- the set's provenance against the current config and checkout ---------
+  try:
+    from drivers import fixed_key
+    key_size = fixed_key.key_size(scheme)
+  except Exception as e:
+    key_size = m.get('key_size')
+    c.warn('current Helios key size', f'unavailable ({type(e).__name__}); '
+                                      f'not compared')
+  problems = ps.identity_problems(
+    m, face_key=face_key, questions=questions, seed=cfg['seed'],
+    booth=ps.booth_js_hashes(), key_size=key_size)
+  (c.ok if not problems else c.fail)(
+    'manifest matches the current face, seed, booth JS and key size',
+    'face, questions, seed, booth JS, key size' if not problems
+    else '; '.join(problems))
+  run_commit = records[0].get('env', {}).get('helios_commit')
+  w = ps.commit_warning(m, run_commit)
+  (c.warn if w else c.ok)('set made at the Helios commit the cell ran at',
+                          w or run_commit)
+
+  # --- validation -------------------------------------------------------------
+  v = snap.get('validation') or {}
+  ok = v.get('passed') and (v.get('validated_count') or 0) >= N
+  (c.ok if ok else c.fail)(
+    'validation.json passed with validated_count >= N',
+    f'passed={v.get("passed")}, validated_count={v.get("validated_count")}, '
+    f'N={N}')
+  # A set found bad after this cell ran makes the cell's board suspect too.
+  now = ps.read_json(ps.validation_path(snap.get('dir', ''))) if snap.get('dir') \
+      else None
+  if now is not None and not now.get('passed'):
+    c.fail('the set still validates', f'{snap["dir"]}/validation.json now FAILS')
 
 
 if __name__ == '__main__':
