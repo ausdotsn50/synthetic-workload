@@ -35,10 +35,53 @@ drivers/
   stage4_decrypt.py    wait for decryption factors, POST /combine_decryptions
   http_client.py       Helios HTTP session; polling helper for Celery-completed phases
   measure_join.py      joins Helios's sidecar timings onto the cell by election uuid
+  fixed_key.py         the fixed trustee key of a prepared-ballot set (key.json)
+  prepared_set.py      prepared-ballot layout, chunks, manifest provenance
+  stage2_populate.py   prepared cells: insert N - S ballots as verified casts, ANALYZE
+  worker.py            fresh Celery worker before a prepared tally; worker RSS probe
 emit.py          append-only JSONL writer, env captured per record
-runner.py        orchestrates one (scheme, N, rep) cell
+runner.py        orchestrates one (scheme, N, rep) cell, live or prepared
+prepare.py       prepared ballots: `keys`, `ballots`, `validate` (not measurements)
+sweep.py         a plan of cells (config/sweep.yaml, config/equivalence.yaml), resumable
+compare_modes.py cast vs insert: medians, IQR, relative difference, tallies identical
 acceptance.py    Milestone 2 acceptance checks
+tests/           unittest suite: python -m unittest discover -s tests -t .
 ```
+
+## Prepared ballots
+
+Ballots outside a cell's live sample are encrypted once, ahead of the runs,
+under one fixed key per (face, scheme), into `prepared/<face>/<scheme>/`
+(gitignored; root is `levels.yaml prepared.dir`):
+
+```bash
+uv run --project ../helios-server python prepare.py keys     --face smoke --scheme elgamal
+uv run --project ../helios-server python prepare.py ballots  --face smoke --scheme elgamal --count 40 --workers 4
+uv run --project ../helios-server python prepare.py validate --face smoke --scheme elgamal
+```
+
+`ballots` needs the Helios server, Celery and Chrome, refuses a dirty
+helios-server, resumes an interrupted run and extends a set when `--count`
+grows. `validate` checks every index against the master plaintext list, then
+proof-checks and decrypts a random sample (default 300, spread over every
+chunk) and tallies a prefix with Helios's own code. It records the 95%
+zero-failure bound on the invalid fraction; any failure fails the whole set.
+
+A prepared cell encrypts and casts a live sample S through the real path, then
+puts ballots S..N-1 on the board by `--populate cast` (real HTTP + Celery) or
+`insert` (the rows a verified cast leaves, written directly):
+
+```bash
+uv run --project ../helios-server python runner.py --face smoke --n 10 --prepared --sample 3 --populate insert
+uv run --project ../helios-server python sweep.py --plan config/equivalence.yaml
+uv run --project ../helios-server python compare_modes.py
+```
+
+It freezes under the set's fixed key (Helios's own keygen still runs and is
+measured), restarts the Celery worker before the tally (window 1 must run the
+worker in its restart loop, SERVER_RUNBOOK.md §4), and records the worker's
+peak RSS during Stages 3 and 4. Needs `psutil` from helios-server's `workload`
+group.
 
 ## Stages
 

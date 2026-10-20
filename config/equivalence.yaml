@@ -1,0 +1,15 @@
+# Bulk on vs bulk off: python sweep.py --plan config/equivalence.yaml
+# then python compare_modes.py
+#
+# Both arms x N in {100, 500} x {cast, insert} x reps. Within each rep, an
+# arm's cast and insert cells run back to back, and the order of arms and of
+# modes flips on odd reps, so neither mode always runs first.
+face: nle2025
+arms: [elgamal, paillier-off]
+levels: [100, 500]
+reps: 3
+ballots: prepared
+sample_size: 10
+populate: [cast, insert]
+strict: true
+cleanup_after: false

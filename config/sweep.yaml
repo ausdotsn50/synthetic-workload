@@ -1,0 +1,17 @@
+# The measurement sweep: python sweep.py --plan config/sweep.yaml
+#
+# Each cell is one runner.py process, small N to large N, both arms at every
+# (N, rep). Accepted cells are recorded in results/sweep_index.jsonl and
+# skipped on a rerun.
+#
+# PLACEHOLDER levels and reps: they are set after the memory probe
+# (worker_peak_rss_bytes) shows how far N can go on the lab box.
+face: nle2025
+arms: [elgamal, paillier-off]
+levels: [100, 500, 1000]
+reps: 3
+ballots: prepared
+sample_size: 10
+populate: [insert]
+strict: true
+cleanup_after: false

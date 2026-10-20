@@ -159,6 +159,24 @@ def classify_runs():
   return dict(runs)
 
 
+def delete_elections(uuids):
+  """
+  Hard-delete the given wl- elections, exactly as --yes does: one transaction
+  each, cascading to Voter, CastVote, VoterFile and Trustee. Anything not
+  matched by find_elections (not wl-, or already gone) is left alone. For
+  sweep.py --cleanup-after, one accepted cell at a time; result files are
+  data and stay. Returns how many were deleted.
+  """
+  helios_env.setup_django()
+  from django.db import transaction
+  wanted = set(uuids)
+  doomed = [e for e in find_elections() if e.uuid in wanted]
+  for e in doomed:
+    with transaction.atomic():
+      e.delete()
+  return len(doomed)
+
+
 # ---- reporting --------------------------------------------------------------
 
 def report(rows, runs):
