@@ -78,6 +78,21 @@ def generate_ballots(seed, questions, count):
   return [generate_ballot(rng, questions) for _ in range(count)]
 
 
+def master_ballots(seed, questions, count):
+  """
+  The one plaintext list every prepared-ballot set is cut from: ballot i of any
+  prepared cell is master_ballots(seed, questions, M)[i].
+
+  generate_ballots draws every ballot from one sequential RNG, so a longer list
+  only appends: master_ballots(s, q, M)[:N] == master_ballots(s, q, N). That
+  prefix property is what lets one prepared set of M ballots serve every N <= M
+  and be extended later without re-encrypting what is already there. The seed
+  is levels.yaml `seed` itself, not cell_seed: the list does not depend on the
+  arm, so both arms still cast identical ballots at the same N.
+  """
+  return generate_ballots(seed, questions, count)
+
+
 def expected_tally(questions, ballots):
   """
   The tally the cast ballots must decrypt to, in the layout of Helios's
