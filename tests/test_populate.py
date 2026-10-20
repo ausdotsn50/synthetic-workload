@@ -1,12 +1,14 @@
 """
-Prepared ballots, Phase 2: insert is what a verified cast leaves behind, a
-wrong set is refused, the sweep orders and skips cells, the probe samples.
+Cells and sweeps: insert is what a verified cast leaves behind, a wrong set is
+refused, a live cell starts on a fresh worker and casts the master list, the
+sweep orders, skips and cleans up cells, the probe samples.
 
     uv run --project ../helios-server python -m unittest discover -s tests -t . -v
 
-The equivalence test drives a real Helios (server, Celery, Postgres) and the
-prepared smoke ElGamal set; it is skipped without them. Its elections are named
-wl-test-*, so cleanup.py removes them.
+The equivalence, empty-database and live-cell tests drive a real Helios
+(server, Celery, Postgres, and Chrome for the live cell); they are skipped
+without it. Their elections are named wl-test-* and deleted afterwards (or by
+cleanup.py).
 """
 
 import json
@@ -212,33 +214,95 @@ class WrongSetRefusedTests(unittest.TestCase):
   def test_runner_refuses_before_stage0(self):
     # Real config: the smoke set holds fewer than this N.
     rc = runner.main(['--face', 'smoke', '--n', '100000', '--prepared',
-                      '--sample', '3', '--populate', 'insert',
-                      '--no-preflight'])
+                      '--sample', '3', '--no-preflight'])
     self.assertEqual(rc, 2)
 
 
 class SweepTests(unittest.TestCase):
 
   PLAN = {'face': 'smoke', 'arms': ['elgamal', 'paillier-off'],
-          'levels': [500, 100], 'reps': 2, 'ballots': 'prepared',
-          'sample_size': 10, 'populate': ['cast', 'insert']}
+          'modes': ['live', 'bulk'], 'levels': [500, 100], 'reps': 2,
+          'sample_size': 10}
 
   def test_order(self):
-    got = [(c['N'], c['rep'], c['arm'], c['populate'])
+    # At each (N, rep, arm) the modes alternate, and on odd reps the order of
+    # arms and of modes flips.
+    got = [(c['N'], c['rep'], c['arm'], c['mode'])
            for c in sweep.cells(self.PLAN)]
     self.assertEqual(len(got), 2 * 2 * 2 * 2)
     self.assertEqual([n for n, *_ in got], sorted(n for n, *_ in got))
-    self.assertEqual(got[:4], [(100, 0, 'elgamal', 'cast'),
-                               (100, 0, 'elgamal', 'insert'),
-                               (100, 0, 'paillier-off', 'cast'),
-                               (100, 0, 'paillier-off', 'insert')])
-    # Odd reps flip both orders.
-    self.assertEqual(got[4:8], [(100, 1, 'paillier-off', 'insert'),
-                                (100, 1, 'paillier-off', 'cast'),
-                                (100, 1, 'elgamal', 'insert'),
-                                (100, 1, 'elgamal', 'cast')])
-    self.assertEqual(len({sweep.cell_key(c) for c in sweep.cells(self.PLAN)}),
-                     len(got))
+    self.assertEqual(got[:4], [(100, 0, 'elgamal', 'live'),
+                               (100, 0, 'elgamal', 'bulk'),
+                               (100, 0, 'paillier-off', 'live'),
+                               (100, 0, 'paillier-off', 'bulk')])
+    self.assertEqual(got[4:8], [(100, 1, 'paillier-off', 'bulk'),
+                                (100, 1, 'paillier-off', 'live'),
+                                (100, 1, 'elgamal', 'bulk'),
+                                (100, 1, 'elgamal', 'live')])
+
+  def test_keys_carry_the_mode(self):
+    cs = sweep.cells(self.PLAN)
+    keys = [sweep.cell_key(c) for c in cs]
+    self.assertEqual(len(set(keys)), len(keys))
+    for c, k in zip(cs, keys):
+      self.assertIn(f'|{c["mode"]}', k)
+    live = next(c for c in cs if c['mode'] == 'live')
+    self.assertIsNone(live['sample_size'])
+    self.assertNotIn('|s=', sweep.cell_key(live))
+
+  def test_stale_plan_keys_refused(self):
+    plan = {**self.PLAN, 'populate': ['cast']}
+    self.assertTrue(sweep.check_plan(plan))
+    self.assertTrue(sweep.check_plan({**self.PLAN, 'modes': ['insert']}))
+    self.assertEqual(sweep.check_plan(self.PLAN), [])
+
+  def test_shipped_plans(self):
+    for path in sorted((helios_env.WORKLOAD_ROOT / 'config').glob('*.yaml')):
+      if path.name in ('levels.yaml', 'ballot_face.yaml'):
+        continue
+      with self.subTest(plan=path.name):
+        import yaml
+        plan = yaml.safe_load(path.read_text())
+        self.assertEqual(sweep.check_plan(plan), [])
+        self.assertEqual(plan['arms'], ['elgamal', 'paillier-off'])
+        self.assertEqual(plan['sample_size'], 10)
+        self.assertTrue(plan['strict'])
+        self.assertTrue(plan['cleanup_after'])
+
+  def test_rerun_skips_everything(self):
+    # A reps: 2 plan run twice: the second run runs nothing. The runner and
+    # acceptance are stubbed; the sweep's own bookkeeping is what is tested.
+    from unittest import mock
+    import acceptance
+    import yaml
+    d = pathlib.Path(tempfile.mkdtemp())
+    try:
+      plan_path = d / 'plan.yaml'
+      plan_path.write_text(yaml.safe_dump(
+        {'face': 'smoke', 'arms': ['elgamal'], 'modes': ['live', 'bulk'],
+         'levels': [10], 'reps': 2, 'sample_size': 3, 'strict': False,
+         'cleanup_after': False}))
+      ran = []
+
+      def fake_run(c, plan, run_id):
+        ran.append(sweep.cell_key(c))
+        (d / f'{run_id}.jsonl').write_text(json.dumps(
+          {'metric': 'election_created', 'extra': {'election_uuid': run_id}})
+          + '\n')
+        return 0
+
+      args = ['--plan', str(plan_path), '--index', str(d / 'index.jsonl')]
+      with mock.patch.object(sweep, 'RESULTS_DIR', d), \
+           mock.patch.object(sweep, 'run_one', fake_run), \
+           mock.patch.object(sweep, 'bytes_per_ballot', return_value=None), \
+           mock.patch.object(acceptance, 'check', return_value=True):
+        self.assertEqual(sweep.main(args), 0)
+        self.assertEqual(len(ran), 4)
+        first = list(ran)
+        self.assertEqual(sweep.main(args), 0)
+      self.assertEqual(ran, first)            # nothing ran the second time
+    finally:
+      shutil.rmtree(d)
 
   def test_accepted_cells_skipped(self):
     d = pathlib.Path(tempfile.mkdtemp())
@@ -267,6 +331,111 @@ class MemoryProbeTests(unittest.TestCase):
     for label in ('a', 'b'):
       self.assertGreaterEqual(peaks[label]['samples'], 2)
       self.assertGreater(peaks[label]['peak_tree_rss'], 0)
+      # The stage-start reading is kept: worker_rss_at_tally_start_bytes.
+      self.assertGreater(peaks[label]['first_tree_rss'], 0)
+      self.assertLessEqual(peaks[label]['first_tree_rss'],
+                           peaks[label]['peak_tree_rss'])
+
+
+@unittest.skipUnless(_server_up(), 'needs the server and Celery')
+class EmptyDatabaseTests(unittest.TestCase):
+  """§C2: after an accepted cell, its election is deleted and the database
+  VACUUM ANALYZEd; a wlprep- generation election is never touched."""
+
+  def test_wl_deleted_wlprep_kept(self):
+    from drivers import stage0_setup
+    from helios.models import Election
+
+    def election(prefix):
+      return stage0_setup.configure(
+        base_url=helios_env.helios_url(),
+        short_name=f'{prefix}-test-empty-{secrets.token_hex(2)}',
+        name='workload test: empty database', n_voters=1,
+        questions=votes_gen.build_questions(FACES['smoke']),
+        scheme='elgamal', ablation={}, log=lambda m: None)
+
+    cell, gen = election('wl'), election('wlprep')
+    try:
+      out = sweep.empty_database(cell)
+      self.assertEqual(out['deleted'], 1)
+      self.assertGreater(out['vacuum_s'], 0)
+      self.assertFalse(Election.objects_with_deleted.filter(uuid=cell).exists())
+      self.assertTrue(Election.objects.filter(uuid=gen).exists())
+      # Asked for by uuid, a wlprep- election is still not deleted.
+      self.assertEqual(sweep.empty_database(gen)['deleted'], 0)
+      self.assertTrue(Election.objects.filter(uuid=gen).exists())
+    finally:
+      Election.objects_with_deleted.filter(uuid=gen).delete()
+
+
+@unittest.skipUnless(_server_up(), 'needs the server, Celery and Chrome')
+class LiveCellTests(unittest.TestCase):
+  """
+  §A: a live smoke cell starts on a fresh worker, ANALYZEs, records the
+  worker's RSS at tally start, and casts master_ballots[:N] -- checked by
+  decrypting every stored vote with the trustee's key.
+  """
+
+  N = 3
+
+  @classmethod
+  def setUpClass(cls):
+    from emit import make_run_id
+    cls.run_id = make_run_id()
+    rc = runner.main(['--face', 'smoke', '--n', str(cls.N), '--live',
+                      '--no-preflight', '--run-id', cls.run_id])
+    assert rc == 0, f'live cell exited {rc}'
+    cls.path = helios_env.WORKLOAD_ROOT / 'results' / f'{cls.run_id}.jsonl'
+    cls.records = [json.loads(line) for line in cls.path.read_text().splitlines()]
+    cls.uuid = next(r for r in cls.records
+                    if r['metric'] == 'election_created')['extra']['election_uuid']
+
+  @classmethod
+  def tearDownClass(cls):
+    import cleanup
+    cleanup.delete_elections([cls.uuid])
+    for p in cls.path.parent.glob(f'{cls.run_id}*.jsonl'):
+      p.unlink()
+
+  def _by(self, metric):
+    return [r for r in self.records if r['metric'] == metric]
+
+  def test_cell_records(self):
+    restarts = self._by('worker_restarted')
+    self.assertEqual(len(restarts), 1)
+    self.assertEqual(restarts[0]['extra']['at'], 'cell_start')
+    self.assertNotEqual(restarts[0]['extra']['old_pid'],
+                        restarts[0]['extra']['new_pid'])
+    self.assertEqual(len(self._by('analyze')), 1)
+    start = self._by('worker_rss_at_tally_start_bytes')
+    self.assertEqual(len(start), 1)
+    self.assertGreater(start[0]['value'], 0)
+    self.assertEqual({r['stage'] for r in self._by('worker_peak_rss_bytes')},
+                     {'aggregate', 'decrypt'})
+    self.assertEqual(self._by('pg_database_size'), [])
+    self.assertEqual(self.records[0]['seed'], CFG['seed'])
+
+  def test_votes_are_master_ballots(self):
+    from helios.models import Election, Voter
+    q = votes_gen.build_questions(FACES['smoke'])
+    master = votes_gen.master_ballots(CFG['seed'], q, self.N)
+    e = Election.objects.get(uuid=self.uuid)
+    sk = e.get_helios_trustee().secret_key
+    decoder = e.public_key.tally_decoder(1)
+    voters = Voter.objects.filter(election=e).order_by('voter_login_id')
+    got = []
+    for v in voters:
+      ballot = []
+      for ea in v.vote.encrypted_answers:
+        bits = [decoder(c.decrypt([sk.decryption_factor(c)], e.public_key))
+                for c in ea.choices]
+        ballot.append([a for a, b in enumerate(bits) if b == 1])
+      got.append(ballot)
+    self.assertEqual(got, master)
+
+  def test_accepted(self):
+    import acceptance
+    self.assertTrue(acceptance.check(str(self.path), self.N))
 
 
 if __name__ == '__main__':

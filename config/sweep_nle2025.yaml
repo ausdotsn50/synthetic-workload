@@ -1,0 +1,15 @@
+# Main sweep, nle2025 face: python sweep.py --plan config/sweep_nle2025.yaml
+#
+# Bulk cells (S live ballots, N - S inserted), both arms, 3 reps, small N to
+# large N. Accepted cells are recorded in results/sweep_index.jsonl and skipped
+# on a rerun; each accepted cell's election is deleted and the database
+# VACUUM ANALYZEd before the next.
+face: nle2025
+arms: [elgamal, paillier-off]
+modes: [bulk]
+# Add 20000 if memory allows: worker_peak_rss_bytes at 10000 decides it.
+levels: [100, 200, 500, 1000, 2000, 5000, 10000]
+reps: 3
+sample_size: 10
+strict: true
+cleanup_after: true

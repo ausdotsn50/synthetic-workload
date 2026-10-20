@@ -1,0 +1,14 @@
+# Live vs bulk, nle2025 face: python sweep.py --plan config/compare_nle2025.yaml
+# then python compare_modes.py --face nle2025
+#
+# At small N, the same cell run both ways: every ballot encrypted, cast and
+# verified (live), and S live with N - S inserted (bulk). An arm's two modes
+# run back to back; on odd reps the orders flip.
+face: nle2025
+arms: [elgamal, paillier-off]
+modes: [live, bulk]
+levels: [50, 100, 200]
+reps: 1
+sample_size: 10
+strict: true
+cleanup_after: true

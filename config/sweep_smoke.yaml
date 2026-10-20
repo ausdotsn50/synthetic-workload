@@ -1,0 +1,13 @@
+# Main sweep, smoke face: python sweep.py --plan config/sweep_smoke.yaml
+#
+# The small two-question ballot (6 answer slots) reaches much larger N than
+# nle2025 for the same memory, which is what this sweep is for. Bulk cells,
+# both arms, 3 reps, small N to large N.
+face: smoke
+arms: [elgamal, paillier-off]
+modes: [bulk]
+levels: [1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000]
+reps: 3
+sample_size: 10
+strict: true
+cleanup_after: true

@@ -1,0 +1,12 @@
+# FALLBACK, if bulk cells are not approved: python sweep.py --plan config/sweep_live.yaml
+#
+# The nle2025 sweep with every ballot encrypted in the browser, cast and
+# verified. Capped at the N a live cell can reach in reasonable time.
+face: nle2025
+arms: [elgamal, paillier-off]
+modes: [live]
+levels: [10, 50, 100, 250, 500]
+reps: 1
+sample_size: 10
+strict: true
+cleanup_after: true

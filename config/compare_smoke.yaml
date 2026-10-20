@@ -1,0 +1,13 @@
+# Live vs bulk, smoke face: python sweep.py --plan config/compare_smoke.yaml
+# then python compare_modes.py --face smoke
+#
+# The same cell run both ways, live and bulk, at N where a live smoke cell is
+# still practical. An arm's two modes run back to back.
+face: smoke
+arms: [elgamal, paillier-off]
+modes: [live, bulk]
+levels: [1000, 2000, 5000]
+reps: 1
+sample_size: 10
+strict: true
+cleanup_after: true

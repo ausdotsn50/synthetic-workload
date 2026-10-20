@@ -1,15 +1,23 @@
 """
-Bulk off (cast) vs bulk on (insert), from accepted prepared cells.
+Live vs bulk, from accepted cells of the comparison plans.
 
     uv run --project ../helios-server python compare_modes.py [--index results/sweep_index.jsonl] [--face nle2025]
 
-For each (face, arm, N): median and IQR of each tally-side metric under each
-mode, and the relative difference of the medians, (insert - cast) / cast. The
-decrypted tallies must be identical across every arm, mode and rep at the
-same (face, N): both modes put master[:N] on the board, and a mode that
-changed the tally would not be a population method but a bug.
+For each (face, arm, N), each mode's value of every tally-side metric -- the
+median when a mode has more than one rep -- and the relative difference
+(bulk - live) / live. A bulk cell's tally and decryption run over the same N
+ballots as a live one, but the cell differs in three ways at once: N - S
+ballots were inserted rather than cast, the worker verified S ballots before
+the tally rather than N, and the election is frozen under the set's fixed key
+rather than the one Helios generated. A difference reflects all three, not
+insertion alone.
 
-Read-only. No significance test: that choice is still open.
+The decrypted tallies must be identical across modes at each (face, N): both
+modes cast master_ballots[:N], so a mode that changed the tally would not be a
+way to fill the board but a bug.
+
+Reads only index entries written with a mode (config/compare_*.yaml and the
+other current plans). Read-only. No significance test: that choice is open.
 """
 
 import argparse
@@ -20,7 +28,9 @@ import sys
 
 import sweep
 
-# (label, function of a cell's records) -> one value per cell.
+MODES = ('live', 'bulk')
+
+
 def _first(records, metric):
   return next((r for r in records if r['metric'] == metric), None)
 
@@ -39,53 +49,40 @@ def _agg_per_ballot(records):
   return r['value'] / r['extra']['n_votes']
 
 
+# (label, unit, function of a cell's records -> one value)
 METRICS = [
-  ('aggregation_time_ns', _value('aggregation_time_ns')),
-  ('aggregation per ballot (ns)', _agg_per_ballot),
-  ('decryption_factor_time_ns', _value('decryption_factor_time_ns')),
-  ('decryption_factor_only_ns', _value('decryption_factor_only_ns')),
-  ('dlog_precompute_time_ns', _value('dlog_precompute_time_ns')),
+  ('aggregation_time_ns', 'ns', _value('aggregation_time_ns')),
+  ('aggregation per ballot', 'ns', _agg_per_ballot),
+  ('decryption_factor_time_ns', 'ns', _value('decryption_factor_time_ns')),
+  ('decryption_factor_only_ns', 'ns', _value('decryption_factor_only_ns')),
+  ('dlog_precompute_time_ns', 'ns', _value('dlog_precompute_time_ns')),
+  ('worker_rss_at_tally_start_bytes', 'bytes',
+   _value('worker_rss_at_tally_start_bytes')),
 ]
-MODES = ('cast', 'insert')
 
 
 def load_cells(index, face=None):
   out = []
   for e in sweep.read_index(index):
-    if not e.get('accepted'):
+    cell = e.get('cell') or {}
+    if not e.get('accepted') or cell.get('mode') not in MODES:
+      continue
+    if face and cell.get('face') != face:
       continue
     with open(e['jsonl']) as f:
       records = [json.loads(line) for line in f if line.strip()]
-    created = (_first(records, 'election_created') or {}).get('extra') or {}
-    if created.get('ballots') != 'prepared':
-      continue
-    if face and created.get('ballot_face') != face:
-      continue
     res = _first(records, 'result')
-    out.append({'face': created.get('ballot_face'), 'arm': created.get('arm'),
-                'N': records[0]['N'], 'rep': records[0]['rep'],
-                'populate': created.get('populate'), 'records': records,
-                'tally': res['value'] if res else None,
-                'jsonl': e['jsonl']})
+    out.append({**cell, 'records': records,
+                'tally': res['value'] if res else None, 'jsonl': e['jsonl']})
   return out
 
 
-def _summary(xs):
-  xs = sorted(x for x in xs if x is not None)
-  if not xs:
-    return None
-  med = statistics.median(xs)
-  if len(xs) >= 2:
-    q1, _q2, q3 = statistics.quantiles(xs, n=4, method='inclusive')
-    iqr = q3 - q1
-  else:
-    iqr = 0.0
-  return {'n': len(xs), 'median': med, 'iqr': iqr}
-
-
-def _fmt(v):
+def _fmt(v, unit):
   if v is None:
     return '—'
+  if unit == 'bytes':
+    import console
+    return console.size(v)
   if v >= 1e9:
     return f'{v / 1e9:.3f} s'
   if v >= 1e6:
@@ -104,7 +101,7 @@ def main(argv=None):
 
   cells = load_cells(args.index, args.face)
   if not cells:
-    print('no accepted prepared cells in', args.index)
+    print('no accepted live or bulk cells in', args.index)
     return 1
 
   # Tallies: one per (face, N), across every arm, mode and rep.
@@ -112,34 +109,35 @@ def main(argv=None):
   for c in cells:
     tallies[(c['face'], c['N'])].add(json.dumps(c['tally']))
   all_same = True
-  print('TALLIES — identical across arms, modes and reps at each (face, N)')
+  print('TALLIES — identical across modes (and arms, and reps) at each (face, N)')
   for (face, N), ts in sorted(tallies.items()):
     same = len(ts) == 1
     all_same &= same
-    n = sum(1 for c in cells if (c['face'], c['N']) == (face, N))
+    modes = sorted({c['mode'] for c in cells if (c['face'], c['N']) == (face, N)})
     print(f'  {face} N={N}: {"identical" if same else "DIFFER"} '
-          f'across {n} cell(s)')
+          f'across {", ".join(modes)}')
 
   groups = collections.defaultdict(list)
   for c in cells:
     groups[(c['face'], c['arm'], c['N'])].append(c)
 
   for (face, arm, N), cs in sorted(groups.items()):
-    by_mode = {m: [c for c in cs if c['populate'] == m] for m in MODES}
+    by_mode = {m: [c for c in cs if c['mode'] == m] for m in MODES}
     print()
     print(f'{face} · {arm} · N={N}   '
-          + ', '.join(f'{m}: {len(by_mode[m])} rep(s)' for m in MODES))
-    print(f'  {"metric":30} {"cast median [IQR]":>24} '
-          f'{"insert median [IQR]":>24} {"rel. diff":>10}')
-    for label, fn in METRICS:
-      s = {m: _summary([fn(c['records']) for c in by_mode[m]]) for m in MODES}
-      if not any(s.values()):
+          + ', '.join(f'{m}: {len(by_mode[m])} cell(s)' for m in MODES))
+    print(f'  {"metric":32} {"live":>12} {"bulk":>12} {"(bulk-live)/live":>17}')
+    for label, unit, fn in METRICS:
+      v = {}
+      for m in MODES:
+        xs = [x for x in (fn(c['records']) for c in by_mode[m]) if x is not None]
+        v[m] = statistics.median(xs) if xs else None
+      if v['live'] is None and v['bulk'] is None:
         continue          # e.g. the dlog metric under Paillier
-      cell = {m: (f'{_fmt(s[m]["median"])} [{_fmt(s[m]["iqr"])}]'
-                  if s[m] else '—') for m in MODES}
-      rel = ('—' if not (s['cast'] and s['insert']) else
-             f'{100 * (s["insert"]["median"] - s["cast"]["median"]) / s["cast"]["median"]:+.1f}%')
-      print(f'  {label:30} {cell["cast"]:>24} {cell["insert"]:>24} {rel:>10}')
+      rel = ('—' if v['live'] in (None, 0) or v['bulk'] is None else
+             f'{100 * (v["bulk"] - v["live"]) / v["live"]:+.1f}%')
+      print(f'  {label:32} {_fmt(v["live"], unit):>12} '
+            f'{_fmt(v["bulk"], unit):>12} {rel:>17}')
 
   return 0 if all_same else 1
 
