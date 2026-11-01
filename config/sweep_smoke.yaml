@@ -3,13 +3,13 @@
 # The small two-question ballot (6 answer slots) reaches much larger N than
 # nle2025 for the same memory, which is what this sweep is for. Bulk cells,
 # both arms, small N to large N: the 1-2-5 series to 200,000, plus 250,000,
-# the top of the range the panel accepted. One rep per level; more reps are run
-# later by raising reps with the same index (accepted cells are skipped).
+# the top of the range the panel accepted. Three reps per level: a 250,000
+# cell takes about 22 min (1 Nov trial), so the whole plan is about 6.5 h.
 face: smoke
 arms: [elgamal, paillier-off]
 modes: [bulk]
 levels: [1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, 250000]
-reps: 1
+reps: 3
 sample_size: 10
 strict: true
 cleanup_after: true
