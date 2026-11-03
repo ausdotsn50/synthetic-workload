@@ -140,6 +140,96 @@ def _check_arm(uuid, scheme, ablation, log):
       f'{ablation}')
 
 
+def install_fixed_key(election_uuid, key_path, log=print):
+  """
+  Replace the election's Helios trustee key with the saved one in key.json.
+
+  Runs after configure() and before freeze(). Helios has already generated and
+  timed its own key by then (Election.generate_trustee, at election creation),
+  so keygen_time_ns is still the real one; this only changes which key the
+  election is frozen with. Freeze copies the trustee key into the election
+  (Election.freeze, models.py ~692) and never checks that it is new, so a
+  prepared ballot encrypted under the saved key verifies and tallies here.
+
+  Shared by prepare.py (the generation election) and runner.py's prepared
+  cells, so both elections hold the key the same way.
+  """
+  import helios_env
+  helios_env.setup_django()
+  from django.db import transaction
+  from helios.models import Election
+  from drivers import fixed_key
+
+  key = fixed_key.load(key_path)
+  with transaction.atomic():
+    # Row lock, so a freeze cannot interleave with the swap. Only the plain
+    # columns are read; the key columns are what is about to change.
+    e = (Election.objects.select_for_update()
+         .only('id', 'uuid', 'frozen_at', 'crypto_scheme')
+         .get(uuid=election_uuid))
+    if e.frozen_at:
+      raise RuntimeError(
+        f'election {election_uuid} was frozen at {e.frozen_at}: its public key '
+        f'is already the generated one, so the saved key can no longer be '
+        f'installed. install_fixed_key must run before freeze.')
+    if e.crypto_scheme != key.scheme:
+      raise RuntimeError(f'election {election_uuid} is {e.crypto_scheme!r} but '
+                         f'{key_path} holds a {key.scheme!r} key')
+    if e.trustee_set.count() != 1:
+      raise RuntimeError(f'election {election_uuid} has '
+                         f'{e.trustee_set.count()} trustees; the swap assumes '
+                         f'the single Helios trustee generate_trustee made')
+    trustee = e.get_helios_trustee()
+    if trustee is None:
+      raise RuntimeError(f'election {election_uuid} has no Helios trustee')
+
+    trustee.public_key = key.public_key
+    trustee.secret_key = key.secret_key
+    trustee.public_key_hash = key.public_key_hash
+    trustee.pok = key.pok
+    trustee.save()
+
+  # Read back from the row, not the object just written.
+  stored = e.trustee_set.get(pk=trustee.pk)
+  got = fixed_key.fingerprint(stored.public_key)
+  if got != key.fingerprint:
+    raise RuntimeError(f'trustee key reads back as {got[:16]}, not the saved '
+                       f'{key.fingerprint[:16]}')
+  log(f'fixed {key.scheme} key installed on the Helios trustee — '
+      f'fingerprint {key.fingerprint[:16]}')
+  return key.fingerprint
+
+
+def check_fixed_key(election_uuid, key_path, log=print):
+  """
+  After freeze: the election's public key must be the saved key, by
+  fingerprint. Next to _check_arm for the same reason -- a cell that silently
+  ran under the generated key would find every prepared ballot failing
+  verification, or worse, a tally of nothing.
+  """
+  import helios_env
+  helios_env.setup_django()
+  from helios.models import Election
+  from drivers import fixed_key
+
+  key = fixed_key.load(key_path)
+  e = Election.objects.get(uuid=election_uuid)
+  if not e.frozen_at:
+    raise RuntimeError(f'election {election_uuid} is not frozen; the election '
+                       f'public key is only set at freeze')
+  if e.public_key is None:
+    raise RuntimeError(f'election {election_uuid} is frozen with no public key')
+  got = fixed_key.fingerprint(e.public_key)
+  if got != key.fingerprint:
+    raise RuntimeError(
+      f'election {election_uuid} is frozen under key {got[:16]}, not the saved '
+      f'key {key.fingerprint[:16]} in {key_path}. Prepared ballots will not '
+      f'verify under it.')
+  log(f'election public key is the saved key — fingerprint '
+      f'{key.fingerprint[:16]}')
+  return got
+
+
 def _find_election_uuid(session, short_name):
   """Resolve short_name -> uuid via the public shortcut route."""
   # Verified with urls.py

@@ -112,7 +112,7 @@ class Progress:
   """
   Rate + ETA for a loop whose per-item cost is the thing we care about.
 
-  Printed after each reported item, never between a Timer's t0 and t1.
+  Printed after each reported item, never inside a timed span.
   """
 
   def __init__(self, total, label, every=None):
@@ -307,8 +307,12 @@ def summary(records, N):
         if r['metric'] == 'cast_payload_bytes'
         and r.get('extra', {}).get('json_bytes')]
   stored = 2 * _median(js) if js else None
+  # In a prepared cell the cast and verify walls cover the live sample only.
+  created = (_first(records, 'election_created') or {}).get('extra') or {}
+  cast_n = (created.get('sample_size') or N
+            if created.get('ballots') == 'prepared' else N)
   _projection(N, enc, agg_per, per_entry, dec_fixed,
-              stored, stage_walls, has_dlog=_has_dlog(records))
+              stored, stage_walls, has_dlog=_has_dlog(records), cast_n=cast_n)
 
 
 def _crypto_ops(records, N):
@@ -497,7 +501,8 @@ def _payload_timing(records, N):
 
 
 def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns,
-                dec_fixed_ns, stored_bytes, stage_walls, has_dlog=True):
+                dec_fixed_ns, stored_bytes, stage_walls, has_dlog=True,
+                cast_n=None):
   """
   Extrapolate this cell's measured per-ballot rates to larger electorates.
 
@@ -529,7 +534,7 @@ def _projection(N, enc_samples, agg_per_ns, dlog_per_entry_ns,
     # in its own column; adding it here would double-count.
     cast_wall = (stage_walls.get('stage 2 cast', 0)
                  + stage_walls.get('stage 2 verify', 0))
-    cast_per = cast_wall / max(N, 1) if cast_wall else None
+    cast_per = cast_wall / max(cast_n or N, 1) if cast_wall else None
 
   hdr = f'  {"N":>9}  {"encrypt":>10}  {"cast+verify":>12}  {"aggregate":>10}  {"decrypt":>9}  {"storage":>10}'
   _p(hdr)
@@ -573,7 +578,7 @@ if __name__ == '__main__':
     records = [json.loads(line) for line in f if line.strip()]
   r0 = records[0]
   N = r0['N']
-  # The arm (elgamal, paillier-off/short/long) is recorded on election_created;
+  # The arm (elgamal, paillier-off) is recorded on election_created;
   # a run from before arms existed has only the scheme.
   created = _first(records, 'election_created')
   arm = ((created or {}).get('extra') or {}).get('arm')

@@ -68,9 +68,6 @@ PROCESS_OF = {
 # Tagged 'flow', like the harness's own payload metrics.
 PAYLOAD_METRICS = {'decryption_factors_bytes', 'decryption_proofs_bytes'}
 
-# Sidecar metrics the harness reads but does not emit. Empty for now.
-SKIP_EMIT = set()
-
 # What a correctly instrumented cell must contain, before acceptance.py
 # subtracts the scheme's forbidden set (schemes.forbidden_metrics): that drops
 # decryption_time_ns for ElGamal, and prove_sk_time_ns and the two dlog metrics

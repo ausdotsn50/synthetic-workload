@@ -1,25 +1,20 @@
 # Default values for level config
 #
-# Two measured arms, one command each (runner.py runs one cell; add --n/--rep):
+# Two measured arms, one command each (runner.py runs one cell; add --n/--rep,
+# and --prepared for a bulk cell):
 #   elgamal         python runner.py
-#   paillier-off    python runner.py --scheme paillier
-# each prefixed with `uv run --project ../helios-server`. At the same (N, rep)
-# both cast identical ballots (generator/votes.py, cell_seed), so the arms
-# compare pairwise.
-schemes:
-  - elgamal
+#   paillier-off    python runner.py --scheme paillier   (CRT proofs on, the
+#                                                         server's default)
+# each prefixed with `uv run --project ../helios-server`. Every cell casts
+# master_ballots(seed, ...)[:N] (generator/votes.py), so at the same N the arms
+# compare pairwise and live and bulk cells tally the same votes. Plans of many
+# cells live in config/*.yaml and run with sweep.py.
+schemes: [elgamal, paillier]
 
-# Paillier defaults, used when --crt-proofs is not given. This
-# is the server's own default: CRT decryption proofs on.
-paillier:
-  crt_proofs: true
-
-levels: # Electoral size/voter count
+levels: # Electoral size/voter count: runner.py's default N
   - 10
 
-repetitions: 3
-
-# For reproducibility, seed per config election run
+# The master ballot list's seed: every cell's plaintexts, in every mode
 seed: 424242
 
 ballot_face: nle2025 # key into config/ballot_face.yaml
@@ -28,20 +23,6 @@ ballot_face: nle2025 # key into config/ballot_face.yaml
 # (helios/models.py:491, "assuming votes already verified"). Verification is real
 # production cost but it is paid at CAST time in Celery, per ballot, not at tally.
 # There is no tally-time verification metric and no max-N gate for one.
-
-# Stage 2a sampled encryption. Pilot at n0, then derive n
-pilot:
-  n0: 1000
-  target_ci_fraction: 0.05   # 95% CI within ±5% of the mean
-  z: 1.96
-
-# Stage 2b bulk generation
-#   pool_size: null      -> every ballot distinct 
-#   pool_size: <int>     -> ballot-pool reuse
-#   stream: true         -> never persist the board 
-bulk:
-  pool_size: 5 # Temporarily removed pool_size logic
-  stream: false
 
 # Timings are taken inside Helios's own code paths (helios/measure.py -- on
 # helios-server master, and merged into paillier-helios, which the server runs).
@@ -62,6 +43,14 @@ measurement:
                       # are exact, both endpoints being in-process.
   timeout_s: 3600
   require_instrumentation: true   # fail the run if sidecar records are missing
+
+# Prepared-ballot sets (prepare.py): one fixed key and one encrypted set per
+# (face, scheme), under <dir>/<face>/<scheme>/. Relative to the workload root.
+# Gitignored: the sets are large, and key.json holds a (synthetic) secret key.
+#   sample_size  S, the default for runner.py --prepared --sample: ballots
+#                0..S-1 encrypted live, supplying every per-ballot metric;
+#                S..N-1 inserted from the set
+prepared: {dir: prepared, sample_size: 10}
 
 # Stage 2 measurement shaping, from the 2026-09-20 calibration run.
 encryption:

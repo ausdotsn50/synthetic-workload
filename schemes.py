@@ -3,15 +3,16 @@ Scheme registry — which cryptosystems this harness can actually drive.
 
 Why this exists (build spec §8.1)
 ---------------------------------
-Before this module, `runner.py --scheme paillier --n 10 --skip keygen` ran a
-complete ElGamal election, stamped "scheme":"paillier" on every emitted record,
-and passed acceptance. Only stage1_freeze branched on scheme, and --skip routed
-around it. A run could claim a scheme it had not executed.
+Before this module, `runner.py --scheme paillier --n 10` with a stage-skipping
+option (since removed) ran a complete ElGamal election, stamped
+"scheme":"paillier" on every emitted record, and passed acceptance. Only
+stage1_freeze branched on scheme, and the skip routed around it. A run could
+claim a scheme it had not executed.
 
 Two independent guards close that, and they are deliberately different in kind:
 
   require(scheme)      BEFORE the run. Refuses to start when the scheme has no
-                       working driver set. Not reachable by --skip.
+                       working driver set, before any stage can be bypassed.
   observed_scheme(...)  AFTER the run. Reads the scheme back out of the artifacts
                        the election actually produced, and acceptance compares it
                        against what the records claim.
@@ -142,8 +143,8 @@ def require(scheme):
   """
   Gate a run. Raises UnsupportedScheme unless every capability is present.
 
-  Called before any stage runs and NOT gated by --skip: skipping a stage must
-  never be a route to claiming a scheme the harness cannot execute.
+  Called before any stage runs, unconditionally: no option may be a route to
+  claiming a scheme the harness cannot execute.
   """
   s = get(scheme)
   missing = s.missing()
@@ -177,16 +178,13 @@ def observed_scheme(ciphertext_dict):
   return None
 
 
-def required_metrics(scheme, ablation=None):
+def required_metrics(scheme):
   """
   Metrics a correct run of this scheme must emit (build spec §8.3).
 
   The dlog metrics are ElGamal-only. Under Paillier there is no discrete-log
   stage, so requiring them would fail a correct run, and emitting them as zero
   would be a claim about a step that never happened.
-
-  `ablation` is the configuration the run claims, in Election.ablation_config's
-  shape.
   """
   s = get(scheme)
   metrics = {
@@ -205,7 +203,7 @@ def required_metrics(scheme, ablation=None):
   return metrics
 
 
-def forbidden_metrics(scheme, ablation=None):
+def forbidden_metrics(scheme):
   """
   Metrics this scheme must NOT emit.
 

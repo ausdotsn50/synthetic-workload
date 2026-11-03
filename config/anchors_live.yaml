@@ -1,0 +1,12 @@
+# FALLBACK, if bulk cells are not approved: python sweep.py --plan config/anchors_live.yaml
+#
+# Repeated live cells at one N, nle2025: the anchor points the live sweep's
+# single-rep cells are read against.
+face: nle2025
+arms: [elgamal, paillier-off]
+modes: [live]
+levels: [100]
+reps: 3
+sample_size: 10
+strict: true
+cleanup_after: true

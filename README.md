@@ -25,8 +25,8 @@ cd ../helios-server && uv sync --group workload
 ## Layout
 
 ```
-config/          levels.yaml, ballot_face.yaml
-generator/       seeded plaintext votes; synthetic voters + credential retrieval
+config/          levels.yaml, ballot_face.yaml; sweep plans (sweep_*, compare_*, *_live)
+generator/       the seeded master ballot list; synthetic voters + credential retrieval
 drivers/
   stage0_setup.py      create the election in the requested arm (trustee key made here), upload voters, freeze
   stage1_encrypt.py    encrypt ballots with Helios's booth code in headless Chrome
@@ -35,10 +35,79 @@ drivers/
   stage4_decrypt.py    wait for decryption factors, POST /combine_decryptions
   http_client.py       Helios HTTP session; polling helper for Celery-completed phases
   measure_join.py      joins Helios's sidecar timings onto the cell by election uuid
+  fixed_key.py         the fixed trustee key of a prepared-ballot set (key.json)
+  prepared_set.py      prepared-ballot layout, chunks, manifest provenance
+  stage2_populate.py   bulk cells: insert N - S ballots as verified casts; ANALYZE (every cell)
+  worker.py            fresh Celery worker at every cell's start; worker RSS probe
 emit.py          append-only JSONL writer, env captured per record
-runner.py        orchestrates one (scheme, N, rep) cell
+runner.py        orchestrates one (scheme, N, rep, mode) cell, live or bulk
+prepare.py       prepared ballots: `keys`, `ballots`, `validate` (not measurements)
+sweep.py         runs a plan of cells, resumable, emptying the database between cells
+compare_modes.py live vs bulk: each metric per mode, relative difference, tallies identical
 acceptance.py    Milestone 2 acceptance checks
+tests/           unittest suite: python -m unittest discover -s tests -t .
 ```
+
+## Cells and modes
+
+One cell is one election: one scheme, one N, one repetition, one mode. Every
+cell starts on a fresh Celery worker, and nothing interrupts the election's own
+pipeline (encrypt → cast → verify → aggregate → decrypt). Every cell casts
+`master_ballots(seed, questions, N)`, so cells at the same N tally the same
+votes whatever their arm or mode.
+
+| Mode | Command | Ballots |
+|---|---|---|
+| `live` | `runner.py --face smoke --n 10` (or `--live`) | all N encrypted in the browser, cast and verified |
+| `bulk` | `runner.py --face smoke --n 10 --prepared --sample 3` | S live as above, plus N − S prepared ballots inserted as verified casts |
+
+Each prefixed with `uv run --project ../helios-server python`; add
+`--scheme paillier` for the `paillier-off` arm (CRT decryption proofs on, the
+server's default). Window 1 of the runbook must run the Celery worker inside its
+restart loop (SERVER_RUNBOOK.md §4): the runner shuts the worker down at the
+start of every cell and waits for the fresh one. Needs `psutil` from
+helios-server's `workload` group, for the worker's RSS probe.
+
+Plans of many cells run with `sweep.py`, which skips accepted cells on a rerun
+and, after each accepted cell, deletes its election and runs `VACUUM ANALYZE`:
+
+| Plan | Face | Modes | Levels | Reps |
+|---|---|---|---|---|
+| `config/sweep_nle2025.yaml` | nle2025 | bulk | 100 … 10000 | 3 |
+| `config/sweep_smoke.yaml` | smoke | bulk | 1000 … 200000 | 3 |
+| `config/compare_nle2025.yaml` | nle2025 | live, bulk | 50, 100, 200 | 1 |
+| `config/compare_smoke.yaml` | smoke | live, bulk | 1000, 2000, 5000 | 1 |
+| `config/sweep_live.yaml` (fallback) | nle2025 | live | 10 … 500 | 1 |
+| `config/anchors_live.yaml` (fallback) | nle2025 | live | 100 | 3 |
+
+```bash
+uv run --project ../helios-server python sweep.py --plan config/compare_smoke.yaml
+uv run --project ../helios-server python compare_modes.py --face smoke
+```
+
+## Prepared ballots
+
+Ballots outside a bulk cell's live sample are encrypted once, ahead of the runs,
+under one fixed key per (face, scheme), into `prepared/<face>/<scheme>/`
+(gitignored; root is `levels.yaml prepared.dir`):
+
+```bash
+uv run --project ../helios-server python prepare.py keys     --face smoke --scheme elgamal
+uv run --project ../helios-server python prepare.py ballots  --face smoke --scheme elgamal --count 40 --workers 4
+uv run --project ../helios-server python prepare.py validate --face smoke --scheme elgamal
+```
+
+`ballots` needs the Helios server, Celery and Chrome, refuses a dirty
+helios-server, resumes an interrupted run and extends a set when `--count`
+grows. `validate` checks every index against the master plaintext list, then
+proof-checks and decrypts a random sample (default 300, spread over every
+chunk) and tallies a prefix with Helios's own code. It records the 95%
+zero-failure bound on the invalid fraction; any failure fails the whole set.
+
+A bulk cell freezes under its set's fixed key (Helios's own keygen still runs
+and is measured), refuses a set that does not match the current face, seed,
+booth or key size, and spot-verifies five inserted ballots with
+`vote.verify(election)`.
 
 ## Stages
 
